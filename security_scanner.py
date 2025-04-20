@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+import argparse, csv, datetime, logging, os, socket, sys, time, nmap, paramiko, requests, ipaddress
+from typing import Dict, List, Optional, Union, Set, Any, Tuple
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import WebDriverException
+from urllib3.exceptions import InsecureRequestWarning
+
+# 안전하지 않은 HTTPS 요청에 대한 경고 무시
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('security_scan.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class SecurityScanner:
+    def __init__(self, target_file: str):
+        """
+        보안 스캐너 초기화
+        
+        Args:
+            target_file: 대상 IP 주소가 포함된 파일 경로 (한 줄에 하나씩)
+                         각 줄은 단일 IP, 호스트명 또는 CIDR 표기법(예: 192.168.1.0/24)일 수 있음
+        """
+        self.target_file = target_file
+        self.targets = []
+        self.scan_results = {}
+        self.responsive_hosts = {}  # 포트 스캔 결과를 저장할 딕셔너리
+        self.current_date = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.result_dir = f"result_{self.current_date}"
+        self.screenshot_dir = f"{self.result_dir}/screenshots"
+        
+        # 결과 디렉토리 생성
+        os.makedirs(self.result_dir, exist_ok=True)
+        os.makedirs(self.screenshot_dir, exist_ok=True)
+        
+        # nmap 스캐너 초기화
+        self.nm = nmap.PortScanner()
+        
+        # 웹드라이버 초기화 (스크린샷 캡처용)
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        
+        # 웹드라이버 설정
+        try:
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.driver.set_window_size(1920, 1080)
+            logger.info("Chrome 웹드라이버가 성공적으로 초기화되었습니다.")
+        except Exception as e:
+            logger.error(f"Chrome 웹드라이버 초기화 실패: {e}")
+            logger.info("Firefox 웹드라이버로 대체합니다.")
+            try:
+                from selenium.webdriver.firefox.options import Options as FirefoxOptions
+                firefox_options = FirefoxOptions()
+                firefox_options.add_argument("--headless")
+                self.driver = webdriver.Firefox(options=firefox_options)
+                self.driver.set_window_size(1920, 1080)
+                logger.info("Firefox 웹드라이버가 성공적으로 초기화되었습니다.")
+            except Exception as e:
+                logger.error(f"Firefox 웹드라이버 초기화 실패: {e}")
+                logger.error("웹 스크린샷 기능을 사용할 수 없습니다.")
+                self.driver = None
+    
+    def parse_target(self, target_str: str) -> List[str]:
+        """
+        타겟 문자열을 파싱하여 IP 주소 리스트를 반환합니다.
+        CIDR 표기법이 사용된 경우 해당 범위의 모든 IP 주소를 생성합니다.
+        
+        Args:
+            target_str: 대상 IP 주소 또는 CIDR 표기법
+            
+        Returns:
+            IP 주소 목록
+        """
+        # 공백 제거
+        target_str = target_str.strip()
+        
+        try:
+            # CIDR 표기법인지 확인 (예: 192.168.1.0/24)
+            if '/' in target_str:
+                network = ipaddress.ip_network(target_str, strict=False)
+                # 네트워크 크기가 너무 큰 경우 경고 (예: /16 이상)
+                if network.num_addresses > 256:
+                    logger.warning(f"매우 큰 네트워크가 지정되었습니다: {target_str} ({network.num_addresses}개 주소). 스캔에 시간이 오래 걸릴 수 있습니다.")
+                # 모든 IP 주소를 문자열 목록으로 반환
+                return [str(ip) for ip in network.hosts()]
+            else:
+                # 단일 IP 주소 또는 호스트명인 경우 그대로 반환
+                return [target_str]
+        except ValueError as e:
+            logger.error(f"유효하지 않은 IP 주소 또는 CIDR 표기법: {target_str} - {e}")
+            return []
+    
+    def read_targets(self) -> List[str]:
+        """대상 IP 주소를 입력 파일에서 읽습니다. CIDR 표기법도 처리합니다."""
+        try:
+            with open(self.target_file, 'r') as f:
+                # 파일의 각 줄을 읽음
+                lines = [line.strip() for line in f if line.strip()]
+            
+            # 모든 타겟 파싱
+            all_targets = []
+            for line in lines:
+                ip_list = self.parse_target(line)
+                all_targets.extend(ip_list)
+            
+            # 중복 제거 및 정렬
+            self.targets = sorted(list(set(all_targets)))
+            
+            logger.info(f"{self.target_file}에서 {len(lines)}개의 입력을 읽어 {len(self.targets)}개의 대상 IP를 생성했습니다.")
+            return self.targets
+        except Exception as e:
+            logger.error(f"대상 파일 읽기 오류: {e}")
+            sys.exit(1)
+    
+    def scan_all_targets(self) -> Dict[str, Dict]:
+        """
+        모든 대상에 대해 초기 포트 스캔을 수행하여 서비스를 탐지합니다.
+        
+        Returns:
+            대상 IP를 키로 하고 서비스 정보를 값으로 하는 딕셔너리
+        """
+        logger.info("모든 대상에 대해 포트 스캔 수행 중...")
+        results = {}
+        
+        # 대상을 배치로 나누어 스캔 (대량 타겟 처리를 위해)
+        batch_size = 50  # 한 번에 스캔할 최대 대상 수
+        total_batches = (len(self.targets) + batch_size - 1) // batch_size
+        
+        for i in range(0, len(self.targets), batch_size):
+            batch = self.targets[i:i+batch_size]
+            
+            logger.info(f"Batch {i//batch_size + 1}/{total_batches} 스캔 중: {len(batch)}개 대상")
+            
+            for target in batch:
+                try:
+                    # TCP SYN 스캔(-sS)을 빠른 타이밍(-T4)으로 수행
+                    # 서비스 버전 감지(-sV) 추가
+                    # 일반 포트(--top-ports 1000)를 스캔하여 빠른 결과 도출
+                    logger.info(f"대상 스캔 중: {target}")
+                    self.nm.scan(target, arguments='-sS -sV -T4 --top-ports 1000')
+
+                    # # 스캔 결과 로깅 (존재 여부 확인 후)
+                    # if target in self.nm.all_hosts():
+                    #     logger.info(f"Nmap 스캔 결과 ({target}): {self.nm[target]}")
+                    # else:
+                    #     logger.warning(f"Nmap 스캔 후 {target}에 대한 결과를 찾을 수 없습니다.")
+
+                    # 결과 구조 초기화
+                    result = {
+                        'ip': target,
+                        'responsive': target in self.nm.all_hosts(),
+                        'ssh': {'open': False, 'ports': []},
+                        'rdp': {'open': False, 'ports': []},
+                        'http': {'open': False, 'ports': []},
+                        'https': {'open': False, 'ports': []}
+                    }
+                    
+                    # 대상이 실제로 스캔되었는지 확인
+                    if not result['responsive']:
+                        logger.warning(f"대상 {target}이(가) 응답하지 않았습니다.")
+                        results[target] = result
+                        continue
+                    
+                    # 스캔 결과 처리
+                    host_data = self.nm[target]
+                    
+                    # TCP 포트만 확인
+                    if 'tcp' not in host_data:
+                        logger.warning(f"대상 {target}에서 열린 TCP 포트가 없습니다.")
+                        results[target] = result
+                        continue
+                    
+                    # 열린 각 포트의 서비스 확인
+                    for port, port_data in host_data['tcp'].items():
+                        if port_data['state'] == 'open':
+                            service_name = port_data.get('name', '').lower()
+                            product = port_data.get('product', '').lower()
+                            
+                            # SSH 서비스 확인
+                            if 'ssh' in service_name:
+                                result['ssh']['open'] = True
+                                result['ssh']['ports'].append(port)
+                                logger.info(f"{target}에서 포트 {port}에 SSH 서비스 감지됨")
+                            
+                            # RDP 서비스 확인
+                            if any(keyword in service_name or keyword in product for keyword in 
+                                ['ms-wbt-server', 'rdp', 'remote desktop', 'msrdp']):
+                                result['rdp']['open'] = True
+                                result['rdp']['ports'].append(port)
+                                logger.info(f"{target}에서 포트 {port}에 RDP 서비스 감지됨")
+                            
+                            # HTTP 서비스 확인 (HTTPS 제외)
+                            if 'http' in service_name and not any(secure in service_name for secure in 
+                                                                ['https', 'ssl', 'tls']):
+                                result['http']['open'] = True
+                                result['http']['ports'].append(port)
+                                logger.info(f"{target}에서 포트 {port}에 HTTP 서비스 감지됨")
+                            
+                            # HTTPS 서비스 확인
+                            if any(keyword in service_name for keyword in ['https', 'ssl/http', 'http-over-ssl']):
+                                result['https']['open'] = True
+                                result['https']['ports'].append(port)
+                                logger.info(f"{target}에서 포트 {port}에 HTTPS 서비스 감지됨")
+                            
+                            # HTTP/HTTPS 추가 확인 (제품 이름이나 버전 정보 사용)
+                            if ('http' in product or 'web' in product or 'apache' in product or
+                                'nginx' in product or 'iis' in product):
+                                is_secure = any(secure in service_name or secure in product for secure in
+                                                ['https', 'ssl', 'tls'])
+                                
+                                if is_secure:
+                                    # 이미 HTTP 포트로 등록되지 않은 경우에만 HTTPS로 추가
+                                    if port not in result['http']['ports']:
+                                        result['https']['open'] = True
+                                        if port not in result['https']['ports']:
+                                            result['https']['ports'].append(port)
+                                            logger.info(f"{target}에서 포트 {port}에 HTTPS 서비스 추가 감지됨 (제품 정보 기반)")
+                                else:
+                                    # 이미 HTTPS 포트로 등록되지 않은 경우에만 HTTP로 추가
+                                    if port not in result['https']['ports']:
+                                        result['http']['open'] = True
+                                        if port not in result['http']['ports']:
+                                            result['http']['ports'].append(port)
+                                            logger.info(f"{target}에서 포트 {port}에 HTTP 서비스 추가 감지됨 (제품 정보 기반)")
+
+                    # 일반적인 포트가 감지되지 않았을 때 기본 포트 확인
+                    # 이미 발견된 포트가 없는 경우에만 기본 포트를 체크합니다
+                    
+                    # 표준 포트 확인 (포트 22의 SSH)
+                    if 'tcp' in host_data and 22 in host_data['tcp'] and host_data['tcp'][22]['state'] == 'open' and not result['ssh']['ports']:
+                        result['ssh']['open'] = True
+                        result['ssh']['ports'].append(22)
+                        logger.info(f"{target}에서 기본 포트 22에 SSH 서비스 감지됨 (서비스 이름 정보 없음)")
+                    
+                    # 표준 포트 확인 (포트 3389의 RDP)
+                    if 'tcp' in host_data and 3389 in host_data['tcp'] and host_data['tcp'][3389]['state'] == 'open' and not result['rdp']['ports']:
+                        result['rdp']['open'] = True
+                        result['rdp']['ports'].append(3389)
+                        logger.info(f"{target}에서 기본 포트 3389에 RDP 서비스 감지됨 (서비스 이름 정보 없음)")
+                    
+                    # 표준 포트 확인 (포트 80의 HTTP)
+                    if 'tcp' in host_data and 80 in host_data['tcp'] and host_data['tcp'][80]['state'] == 'open' and not result['http']['ports']:
+                        result['http']['open'] = True
+                        result['http']['ports'].append(80)
+                        logger.info(f"{target}에서 기본 포트 80에 HTTP 서비스 감지됨 (서비스 이름 정보 없음)")
+                    
+                    # 표준 포트 확인 (포트 443의 HTTPS)
+                    if 'tcp' in host_data and 443 in host_data['tcp'] and host_data['tcp'][443]['state'] == 'open' and not result['https']['ports']:
+                        result['https']['open'] = True
+                        result['https']['ports'].append(443)
+                        logger.info(f"{target}에서 기본 포트 443에 HTTPS 서비스 감지됨 (서비스 이름 정보 없음)")
+                    
+                    # 모든 서비스의 포트 정렬
+                    for service in ['ssh', 'rdp', 'http', 'https']:
+                        result[service]['ports'] = sorted(result[service]['ports'])
+                    
+                    results[target] = result
+                    
+                except Exception as e:
+                    logger.error(f"{target} 스캔 오류: {e}")
+                    results[target] = {
+                        'ip': target,
+                        'responsive': False,
+                        'ssh': {'open': False, 'ports': []},
+                        'rdp': {'open': False, 'ports': []},
+                        'http': {'open': False, 'ports': []},
+                        'https': {'open': False, 'ports': []}
+                    }
+        
+        # 응답한 호스트 수 계산
+        responsive_count = sum(1 for result in results.values() if result['responsive'])
+        logger.info(f"총 {len(self.targets)}개 대상 중 {responsive_count}개 응답 호스트 발견")
+        
+        return results
+    
+    def prepare_detailed_scan(self, scan_info: Dict) -> Dict[str, Any]:
+        """
+        초기 포트 스캔 결과를 기반으로 상세 점검을 위한 결과 구조를 준비합니다.
+        
+        Args:
+            scan_info: 초기 포트 스캔 결과
+            
+        Returns:
+            스크린샷 필드가 추가된 결과 Dictionary
+        """
+        result = {
+            'ip': scan_info['ip'],
+            'responsive': scan_info['responsive'],
+            'ssh': {
+                'open': scan_info['ssh']['open'],
+                'ports': scan_info['ssh']['ports'].copy(),
+                'screenshots': {}
+            },
+            'rdp': {
+                'open': scan_info['rdp']['open'],
+                'ports': scan_info['rdp']['ports'].copy(),
+                'screenshots': {}
+            },
+            'http': {
+                'open': scan_info['http']['open'],
+                'ports': scan_info['http']['ports'].copy(),
+                'screenshots': {}
+            },
+            'https': {
+                'open': scan_info['https']['open'],
+                'ports': scan_info['https']['ports'].copy(),
+                'screenshots': {}
+            }
+        }
+        
+        return result
+    
+    def capture_ssh_screenshot(self, target: str, ports: List[int]) -> Dict[int, str]:
+        """
+        SSH 연결 스크린샷 캡처 (여러 포트 지원)
+        
+        Args:
+            target: SSH 서버의 IP 주소
+            ports: 확인할 SSH 포트 목록
+            
+        Returns:
+            포트별 스크린샷 파일 경로를 포함하는 Dictionary
+        """
+        screenshots = {}
+        
+        for port in ports:
+            logger.info(f"{target}의 포트 {port}에 대한 SSH 스크린샷 캡처 시도 중")
+            
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                
+                # 타임아웃과 함께 연결 시도
+                client.connect(target, port=port, username='invaliduser', password='invalidpassword', timeout=5)
+                
+                # 예외 없이 이 위치에 도달하면 연결이 허용된 것(유효하지 않은 자격 증명으로는 불가능함)
+                logger.warning(f"{target}의 포트 {port}에 대한 SSH 연결이 유효하지 않은 자격 증명을 수락했습니다!")
+                client.close()
+                
+            except paramiko.AuthenticationException:
+                # 이것은 실제로 "성공" - 서버가 존재하고 응답하지만 인증은 거부함
+                logger.info(f"{target}의 포트 {port}에 대한 SSH 인증 실패 (예상된 동작)")
+                
+                # 연결 정보가 포함된 텍스트 파일을 "스크린샷"으로 생성
+                screenshot_path = f"{self.screenshot_dir}/{target}_ssh_port_{port}.txt"
+                with open(screenshot_path, 'w') as f:
+                    f.write(f"{target}의 포트 {port}에 대한 SSH 연결 확인됨\n")
+                    f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
+                    f.write("테스트 자격 증명으로 인증 실패 (예상된 동작)\n")
+                
+                screenshots[port] = screenshot_path
+                
+            except (socket.error, paramiko.SSHException) as e:
+                logger.error(f"{target}의 포트 {port}에 대한 SSH 연결 오류: {e}")
+                
+            except Exception as e:
+                logger.error(f"{target}의 포트 {port}에 대한 SSH 스크린샷 캡처 중 예상치 못한 오류: {e}")
+        
+        return screenshots
+    
+    def capture_rdp_screenshot(self, target: str, ports: List[int]) -> Dict[int, str]:
+        """
+        RDP 연결성 확인 (여러 포트 지원)
+        
+        Args:
+            target: RDP 서버의 IP 주소
+            ports: 확인할 RDP 포트 목록
+            
+        Returns:
+            포트별 스크린샷 파일 경로를 포함하는 Dictionary
+        """
+        screenshots = {}
+        
+        for port in ports:
+            logger.info(f"{target}의 포트 {port}에 대한 RDP 연결성 확인 중")
+            
+            try:
+                # RDP 포트가 응답하는지 확인하기 위한 간단한 소켓 연결
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5)
+                s.connect((target, port))
+                
+                # RDP 서버는 프로토콜 핸드셰이크의 일부로 일부 데이터를 다시 보내야 함
+                initial_data = s.recv(1024)
+                s.close()
+                
+                if initial_data:
+                    logger.info(f"{target}의 포트 {port}에서 RDP 서비스 응답 확인")
+                    
+                    # 연결 정보가 포함된 텍스트 파일을 "스크린샷"으로 생성
+                    screenshot_path = f"{self.screenshot_dir}/{target}_rdp_port_{port}.txt"
+                    with open(screenshot_path, 'w') as f:
+                        f.write(f"{target}의 포트 {port}에 대한 RDP 연결 확인됨\n")
+                        f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
+                        f.write(f"초기 핸드셰이크에서 {len(initial_data)} 바이트 수신\n")
+                    
+                    screenshots[port] = screenshot_path
+                else:
+                    logger.warning(f"{target}의 포트 {port}의 RDP 서비스가 초기 데이터를 보내지 않았습니다")
+                    
+            except socket.error as e:
+                logger.error(f"{target}의 포트 {port}에 대한 RDP 연결 오류: {e}")
+                
+            except Exception as e:
+                logger.error(f"{target}의 포트 {port}에 대한 RDP 확인 중 예상치 못한 오류: {e}")
+                
+        return screenshots
+    
+    def capture_web_screenshot(self, target: str, ports: List[int], is_https: bool) -> Dict[int, str]:
+        """
+        웹 페이지 스크린샷 캡처 (여러 포트 지원)
+        
+        Args:
+            target: 웹 서버의 IP 주소
+            ports: 확인할 웹 서버 포트 목록
+            is_https: HTTPS 프로토콜 사용 여부
+            
+        Returns:
+            포트별 스크린샷 파일 경로를 포함하는 Dictionary
+        """
+        protocol = "https" if is_https else "http"
+        screenshots = {}
+        
+        # 웹드라이버가 초기화되지 않은 경우
+        if self.driver is None:
+            logger.error("웹드라이버가 초기화되지 않았습니다. 웹 스크린샷을 캡처할 수 없습니다.")
+            return screenshots
+        
+        for port in ports:
+            url = f"{protocol}://{target}"
+            
+            # 표준 포트가 아닌 경우 포트 번호 추가
+            if (is_https and port != 443) or (not is_https and port != 80):
+                url = f"{url}:{port}"
+                
+            logger.info(f"{url}에 대한 스크린샷 캡처 중")
+            
+            try:
+                # 먼저 requests를 사용하여 페이지에 접근 가능한지 확인
+                response = requests.get(url, timeout=10, verify=False)
+                
+                if response.status_code < 400:  # 오류가 아닌 응답을 성공으로 간주
+                    # Selenium을 사용하여 스크린샷 캡처
+                    self.driver.get(url)
+                    time.sleep(3)  # 페이지 로드 대기
+                    
+                    screenshot_path = f"{self.screenshot_dir}/{target}_{protocol}_port_{port}.png"
+                    self.driver.save_screenshot(screenshot_path)
+                    
+                    logger.info(f"{url}에 대한 스크린샷이 {screenshot_path}에 저장되었습니다")
+                    screenshots[port] = screenshot_path
+                else:
+                    logger.warning(f"{url}에 대해 상태 코드 {response.status_code} 수신")
+                    
+            except requests.RequestException as e:
+                logger.error(f"{url}에 대한 요청 오류: {e}")
+                
+            except WebDriverException as e:
+                logger.error(f"{url}에 대한 웹드라이버 오류: {e}")
+                
+            except Exception as e:
+                logger.error(f"{url}에 대한 스크린샷 캡처 중 예상치 못한 오류: {e}")
+                
+        return screenshots
+    
+    def check_services(self, scan_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        서비스 접근성을 확인하고 스크린샷을 캡처합니다.
+        
+        Args:
+            scan_result: nmap 스캔 결과
+            
+        Returns:
+            스크린샷 경로로 업데이트된 스캔 결과
+        """
+        target = scan_result['ip']
+        logger.info(f"{target}에 대한 서비스 확인 중")
+        
+        # SSH 확인 (감지된 모든 포트)
+        if scan_result['ssh']['open'] and scan_result['ssh']['ports']:
+            scan_result['ssh']['screenshots'] = self.capture_ssh_screenshot(target, scan_result['ssh']['ports'])
+        
+        # RDP 확인 (감지된 모든 포트)
+        if scan_result['rdp']['open'] and scan_result['rdp']['ports']:
+            scan_result['rdp']['screenshots'] = self.capture_rdp_screenshot(target, scan_result['rdp']['ports'])
+        
+        # HTTP 확인 (감지된 모든 포트)
+        if scan_result['http']['open'] and scan_result['http']['ports']:
+            scan_result['http']['screenshots'] = self.capture_web_screenshot(target, scan_result['http']['ports'], False)
+        
+        # HTTPS 확인 (감지된 모든 포트)
+        if scan_result['https']['open'] and scan_result['https']['ports']:
+            scan_result['https']['screenshots'] = self.capture_web_screenshot(target, scan_result['https']['ports'], True)
+        
+        return scan_result
+    
+    def generate_markdown_report(self) -> str:
+        """스캔 결과의 Markdown 보고서를 생성합니다."""
+        report_path = f"{self.result_dir}/result_{self.current_date}.md"
+        
+        with open(report_path, 'w') as f:
+            f.write(f"# 보안 스캔 보고서\n\n")
+            f.write(f"**날짜:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            f.write("## 요약\n\n")
+            responsive_count = sum(1 for result in self.scan_results.values() if result.get('responsive', False))
+            f.write(f"스캔된 총 대상: {len(self.scan_results)}\n")
+            f.write(f"응답 호스트: {responsive_count}\n\n")
+            
+            f.write("| IP 주소 | 응답 | SSH | RDP | HTTP | HTTPS |\n")
+            f.write("|------------|------|-----|-----|------|-------|\n")
+            
+            for target, result in self.scan_results.items():
+                # 응답 상태 표시
+                responsive_status = "✅" if result.get('responsive', False) else "❌"
+                
+                # 서비스 포트 정보 포맷팅 (비응답 호스트는 항상 닫힘)
+                if not result.get('responsive', False):
+                    ssh_status = rdp_status = http_status = https_status = "❌"
+                else:
+                    ssh_status = f"✅ ({', '.join(map(str, result['ssh']['ports']))})" if result['ssh']['open'] else "❌"
+                    rdp_status = f"✅ ({', '.join(map(str, result['rdp']['ports']))})" if result['rdp']['open'] else "❌"
+                    http_status = f"✅ ({', '.join(map(str, result['http']['ports']))})" if result['http']['open'] else "❌"
+                    https_status = f"✅ ({', '.join(map(str, result['https']['ports']))})" if result['https']['open'] else "❌"
+                
+                f.write(f"| {target} | {responsive_status} | {ssh_status} | {rdp_status} | {http_status} | {https_status} |\n")
+            
+            f.write("\n## 상세 결과\n\n")
+            
+            for target, result in self.scan_results.items():
+                f.write(f"### {target}\n\n")
+                
+                # 비응답 호스트 처리
+                if not result.get('responsive', False):
+                    f.write("상태: **비응답**\n\n")
+                    f.write("이 호스트는 포트 스캔에 응답하지 않았습니다. 상세 서비스 점검이 수행되지 않았습니다.\n\n")
+                    f.write("\n---\n\n")
+                    continue
+                
+                # SSH
+                f.write("#### SSH 서비스\n\n")
+                if result['ssh']['open']:
+                    ssh_ports = ", ".join(map(str, result['ssh']['ports']))
+                    f.write(f"상태: **열림** (포트: {ssh_ports})\n\n")
+                    
+                    # 각 SSH 포트에 대한 연결 세부 정보 링크
+                    for port, screenshot_path in result['ssh']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"[포트 {port}의 SSH 연결 세부 정보]({rel_path})\n\n")
+                else:
+                    f.write("상태: **닫힘**\n\n")
+                
+                # RDP
+                f.write("#### RDP 서비스\n\n")
+                if result['rdp']['open']:
+                    rdp_ports = ", ".join(map(str, result['rdp']['ports']))
+                    f.write(f"상태: **열림** (포트: {rdp_ports})\n\n")
+                    
+                    # 각 RDP 포트에 대한 연결 세부 정보 링크
+                    for port, screenshot_path in result['rdp']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"[포트 {port}의 RDP 연결 세부 정보]({rel_path})\n\n")
+                else:
+                    f.write("상태: **닫힘**\n\n")
+                
+                # HTTP
+                f.write("#### HTTP 서비스\n\n")
+                if result['http']['open']:
+                    http_ports = ", ".join(map(str, result['http']['ports']))
+                    f.write(f"상태: **열림** (포트: {http_ports})\n\n")
+                    
+                    # 각 HTTP 포트에 대한 스크린샷
+                    for port, screenshot_path in result['http']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"**포트 {port}의 HTTP 스크린샷:**\n\n")
+                            f.write(f"![HTTP 포트 {port} 스크린샷]({rel_path})\n\n")
+                else:
+                    f.write("상태: **닫힘**\n\n")
+                
+                # HTTPS
+                f.write("#### HTTPS 서비스\n\n")
+                if result['https']['open']:
+                    https_ports = ", ".join(map(str, result['https']['ports']))
+                    f.write(f"상태: **열림** (포트: {https_ports})\n\n")
+                    
+                    # 각 HTTPS 포트에 대한 스크린샷
+                    for port, screenshot_path in result['https']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"**포트 {port}의 HTTPS 스크린샷:**\n\n")
+                            f.write(f"![HTTPS 포트 {port} 스크린샷]({rel_path})\n\n")
+                else:
+                    f.write("상태: **닫힘**\n\n")
+                
+                f.write("\n---\n\n")
+        
+        logger.info(f"Markdown 보고서가 {report_path}에 생성되었습니다")
+        return report_path
+    
+    def generate_html_report(self) -> str:
+        """스캔 결과의 HTML 보고서를 생성합니다."""
+        report_path = f"{self.result_dir}/result_{self.current_date}.html"
+        
+        with open(report_path, 'w') as f:
+            f.write("""
+            <!DOCTYPE html>
+            <html lang="ko">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>보안 스캔 보고서</title>
+                <style>
+                    body {
+                        font-family: Arial, sans-serif;
+                        line-height: 1.6;
+                        margin: 0;
+                        padding: 20px;
+                        color: #333;
+                    }
+                    h1, h2, h3, h4, h5 {
+                        color: #2c3e50;
+                    }
+                    table {
+                        border-collapse: collapse;
+                        width: 100%;
+                        margin-bottom: 20px;
+                    }
+                    th, td {
+                        border: 1px solid #ddd;
+                        padding: 8px;
+                        text-align: left;
+                    }
+                    th {
+                        background-color: #f2f2f2;
+                    }
+                    tr:nth-child(even) {
+                        background-color: #f9f9f9;
+                    }
+                    .status-open {
+                        color: green;
+                        font-weight: bold;
+                    }
+                    .status-closed {
+                        color: red;
+                    }
+                    .status-nonresponsive {
+                        color: gray;
+                        font-style: italic;
+                    }
+                    img {
+                        max-width: 100%;
+                        border: 1px solid #ddd;
+                        margin: 10px 0;
+                    }
+                    .target-section {
+                        margin-bottom: 30px;
+                        border: 1px solid #eee;
+                        padding: 15px;
+                        border-radius: 5px;
+                    }
+                    .port-info {
+                        color: #555;
+                        font-style: italic;
+                    }
+                    .service-detail {
+                        margin: 10px 0 20px 20px;
+                        padding: 10px;
+                        border-left: 3px solid #eee;
+                    }
+                </style>
+            </head>
+            <body>
+                <h1>보안 스캔 보고서</h1>
+                <p><strong>날짜:</strong> """ + datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """</p>
+                
+                <h2>요약</h2>
+            """)
+            
+            responsive_count = sum(1 for result in self.scan_results.values() if result.get('responsive', False))
+            f.write(f"""
+                <p><strong>총 스캔 대상:</strong> {len(self.scan_results)}</p>
+                <p><strong>응답 호스트:</strong> {responsive_count}</p>
+                
+                <table>
+                    <tr>
+                        <th>IP 주소</th>
+                        <th>응답</th>
+                        <th>SSH</th>
+                        <th>RDP</th>
+                        <th>HTTP</th>
+                        <th>HTTPS</th>
+                    </tr>
+            """)
+            
+            for target, result in self.scan_results.items():
+                # 응답 상태 표시
+                responsive_status = "✅" if result.get('responsive', False) else "❌"
+                
+                # 서비스 포트 정보 포맷팅 (비응답 호스트는 항상 닫힘)
+                if not result.get('responsive', False):
+                    ssh_status = rdp_status = http_status = https_status = "❌"
+                else:
+                    ssh_status = f"✅ (포트: {', '.join(map(str, result['ssh']['ports']))})" if result['ssh']['open'] else "❌"
+                    rdp_status = f"✅ (포트: {', '.join(map(str, result['rdp']['ports']))})" if result['rdp']['open'] else "❌"
+                    http_status = f"✅ (포트: {', '.join(map(str, result['http']['ports']))})" if result['http']['open'] else "❌"
+                    https_status = f"✅ (포트: {', '.join(map(str, result['https']['ports']))})" if result['https']['open'] else "❌"
+                
+                f.write(f"""
+                    <tr>
+                        <td>{target}</td>
+                        <td>{responsive_status}</td>
+                        <td>{ssh_status}</td>
+                        <td>{rdp_status}</td>
+                        <td>{http_status}</td>
+                        <td>{https_status}</td>
+                    </tr>
+                """)
+            
+            f.write("""
+                </table>
+                
+                <h2>상세 결과</h2>
+            """)
+            
+            for target, result in self.scan_results.items():
+                f.write(f"""
+                <div class="target-section">
+                    <h3>{target}</h3>
+                """)
+                
+                # 비응답 호스트 처리
+                if not result.get('responsive', False):
+                    f.write("""
+                    <p class="status-nonresponsive">상태: 비응답</p>
+                    <p>이 호스트는 포트 스캔에 응답하지 않았습니다. 상세 서비스 점검이 수행되지 않았습니다.</p>
+                    </div>
+                    """)
+                    continue
+                
+                # SSH
+                f.write("""
+                    <h4>SSH 서비스</h4>
+                """)
+                
+                if result['ssh']['open']:
+                    ssh_ports = ", ".join(map(str, result['ssh']['ports']))
+                    f.write(f"""
+                    <p class="status-open">상태: 열림 <span class="port-info">(포트: {ssh_ports})</span></p>
+                    """)
+                    
+                    # 각 SSH 포트에 대한 연결 세부 정보
+                    for port, screenshot_path in result['ssh']['screenshots'].items():
+                        if screenshot_path:
+                            with open(screenshot_path, 'r') as ssh_file:
+                                ssh_details = ssh_file.read()
+                            f.write(f"""
+                            <div class="service-detail">
+                                <h5>포트 {port}의 SSH 연결 세부 정보</h5>
+                                <pre>{ssh_details}</pre>
+                            </div>
+                            """)
+                else:
+                    f.write("""
+                    <p class="status-closed">상태: 닫힘</p>
+                    """)
+                
+                f.write("""
+                    <h4>RDP 서비스</h4>
+                """)
+                
+                if result['rdp']['open']:
+                    rdp_ports = ", ".join(map(str, result['rdp']['ports']))
+                    f.write(f"""
+                    <p class="status-open">상태: 열림 <span class="port-info">(포트: {rdp_ports})</span></p>
+                    """)
+                    
+                    # 각 RDP 포트에 대한 연결 세부 정보
+                    for port, screenshot_path in result['rdp']['screenshots'].items():
+                        if screenshot_path:
+                            with open(screenshot_path, 'r') as rdp_file:
+                                rdp_details = rdp_file.read()
+                            f.write(f"""
+                            <div class="service-detail">
+                                <h5>포트 {port}의 RDP 연결 세부 정보</h5>
+                                <pre>{rdp_details}</pre>
+                            </div>
+                            """)
+                else:
+                    f.write("""
+                    <p class="status-closed">상태: 닫힘</p>
+                    """)
+                
+                f.write("""
+                    <h4>HTTP 서비스</h4>
+                """)
+                
+                if result['http']['open']:
+                    http_ports = ", ".join(map(str, result['http']['ports']))
+                    f.write(f"""
+                    <p class="status-open">상태: 열림 <span class="port-info">(포트: {http_ports})</span></p>
+                    """)
+                    
+                    # 각 HTTP 포트에 대한 스크린샷
+                    for port, screenshot_path in result['http']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"""
+                            <div class="service-detail">
+                                <h5>포트 {port}의 HTTP 스크린샷</h5>
+                                <img src="{rel_path}" alt="HTTP 포트 {port} 스크린샷">
+                            </div>
+                            """)
+                else:
+                    f.write("""
+                    <p class="status-closed">상태: 닫힘</p>
+                    """)
+                
+                f.write("""
+                    <h4>HTTPS 서비스</h4>
+                """)
+                
+                if result['https']['open']:
+                    https_ports = ", ".join(map(str, result['https']['ports']))
+                    f.write(f"""
+                    <p class="status-open">상태: 열림 <span class="port-info">(포트: {https_ports})</span></p>
+                    """)
+                    
+                    # 각 HTTPS 포트에 대한 스크린샷
+                    for port, screenshot_path in result['https']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"""
+                            <div class="service-detail">
+                                <h5>포트 {port}의 HTTPS 스크린샷</h5>
+                                <img src="{rel_path}" alt="HTTPS 포트 {port} 스크린샷">
+                            </div>
+                            """)
+                else:
+                    f.write("""
+                    <p class="status-closed">상태: 닫힘</p>
+                    """)
+                
+                f.write("""
+                </div>
+                """)
+            
+            f.write("""
+            </body>
+            </html>
+            """)
+        
+        logger.info(f"HTML 보고서가 {report_path}에 생성되었습니다")
+        return report_path
+    
+    def generate_csv_report(self) -> str:
+        """스캔 결과의 CSV 보고서를 생성합니다."""
+        report_path = f"{self.result_dir}/result_{self.current_date}.csv"
+        
+        with open(report_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTPS', 'HTTPS_포트'])
+            
+            for target, result in self.scan_results.items():
+                responsive_status = "Y" if result.get('responsive', False) else "N"
+                
+                if not result.get('responsive', False):
+                    # 비응답 호스트는 모든 서비스가 닫힘
+                    writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "N", ""])
+                    continue
+                
+                ssh_status = "Y" if result['ssh']['open'] else "N"
+                ssh_ports = ";".join(map(str, result['ssh']['ports'])) if result['ssh']['ports'] else ""
+                
+                rdp_status = "Y" if result['rdp']['open'] else "N"
+                rdp_ports = ";".join(map(str, result['rdp']['ports'])) if result['rdp']['ports'] else ""
+                
+                http_status = "Y" if result['http']['open'] else "N"
+                http_ports = ";".join(map(str, result['http']['ports'])) if result['http']['ports'] else ""
+                
+                https_status = "Y" if result['https']['open'] else "N"
+                https_ports = ";".join(map(str, result['https']['ports'])) if result['https']['ports'] else ""
+                
+                writer.writerow([
+                    target, 
+                    responsive_status,
+                    ssh_status, ssh_ports, 
+                    rdp_status, rdp_ports, 
+                    http_status, http_ports, 
+                    https_status, https_ports
+                ])
+        
+        logger.info(f"CSV 보고서가 {report_path}에 생성되었습니다")
+        return report_path
+    
+    def run(self):
+        """전체 보안 스캔 프로세스를 실행합니다."""
+        # 대상 읽기
+        self.read_targets()
+        
+        if not self.targets:
+            logger.error("유효한 대상이 없습니다. 종료합니다.")
+            sys.exit(1)
+        
+        # 모든 호스트에 대해 초기 포트 스캔 수행
+        logger.info("모든 대상에 대해 초기 포트 스캔 수행 중...")
+        self.responsive_hosts = self.scan_all_targets()
+        
+        responsive_count = sum(1 for result in self.responsive_hosts.values() if result['responsive'])
+        if responsive_count == 0:
+            logger.warning("응답하는 호스트가 없습니다. 종료합니다.")
+            
+            # 비응답 호스트를 결과에 포함
+            for target, scan_info in self.responsive_hosts.items():
+                self.scan_results[target] = self.prepare_detailed_scan(scan_info)
+                
+            # 보고서는 생성
+            self.generate_markdown_report()
+            self.generate_html_report()
+            self.generate_csv_report()
+            
+            # 웹드라이버 종료
+            if hasattr(self, 'driver') and self.driver is not None:
+                self.driver.quit()
+            
+            logger.info("보안 스캔이 완료되었습니다 (응답 호스트 없음)")
+            return
+        
+        # 응답한 호스트에 대해서만 상세 서비스 점검 수행
+        logger.info(f"응답한 {responsive_count}개 호스트에 대해 상세 서비스 점검 수행 중...")
+        for target, scan_info in self.responsive_hosts.items():
+            if scan_info['responsive']:
+                # 초기 스캔 결과에서 상세 점검을 위한 구조로 변환
+                detailed_result = self.prepare_detailed_scan(scan_info)
+                
+                # 서비스 연결 확인 및 스크린샷 캡처
+                checked_result = self.check_services(detailed_result)
+                self.scan_results[target] = checked_result
+            else:
+                # 응답하지 않는 호스트는 스크린샷 필드만 추가하여 결과에 포함
+                self.scan_results[target] = self.prepare_detailed_scan(scan_info)
+        
+        # 보고서 생성
+        self.generate_markdown_report()
+        self.generate_html_report()
+        self.generate_csv_report()
+        
+        # 웹드라이버 종료
+        if hasattr(self, 'driver') and self.driver is not None:
+            self.driver.quit()
+        
+        logger.info("보안 스캔이 성공적으로 완료되었습니다")
+
+def main():
+    parser = argparse.ArgumentParser(description='보안 스캐너 도구')
+    parser.add_argument('--target-file', '-t', default='target.txt', 
+                        help='대상 IP 주소가 포함된 파일 경로 (기본값: target.txt). 한 줄에 하나씩 IP, 호스트명 또는 CIDR 표기법을 사용합니다.')
+    args = parser.parse_args()
+    
+    scanner = SecurityScanner(args.target_file)
+    scanner.run()
+
+if __name__ == "__main__":
+    main()

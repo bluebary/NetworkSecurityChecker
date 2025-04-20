@@ -1,0 +1,5 @@
+python-nmap>=0.7.1
+paramiko>=2.7.2
+requests>=2.25.1
+selenium>=4.1.0
+urllib3>=1.26.5
