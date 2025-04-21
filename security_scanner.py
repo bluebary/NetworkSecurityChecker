@@ -16,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('security_scan.log'),
+        logging.FileHandler('security_scan.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -72,6 +72,16 @@ class SecurityScanner:
                 logger.error("웹 스크린샷 기능을 사용할 수 없습니다.")
                 self.driver = None
     
+    # PyInstaller 패키징 시 리소스 경로 얻기
+    def resource_path(relative_path):
+        """ 리소스 파일의 절대 경로를 가져옵니다. """
+        try:
+            # PyInstaller는 임시 폴더 _MEIPASS에 번들을 생성합니다
+            base_path = sys._MEIPASS
+        except Exception:
+            base_path = os.path.abspath(".")
+        return os.path.join(base_path, relative_path)
+    
     def parse_target(self, target_str: str) -> List[str]:
         """
         타겟 문자열을 파싱하여 IP 주소 리스트를 반환합니다.
@@ -105,7 +115,7 @@ class SecurityScanner:
     def read_targets(self) -> List[str]:
         """대상 IP 주소를 입력 파일에서 읽습니다. CIDR 표기법도 처리합니다."""
         try:
-            with open(self.target_file, 'r') as f:
+            with open(self.target_file, 'r', encoding='utf-8') as f:
                 # 파일의 각 줄을 읽음
                 lines = [line.strip() for line in f if line.strip()]
             
@@ -150,12 +160,6 @@ class SecurityScanner:
                     # 일반 포트(--top-ports 1000)를 스캔하여 빠른 결과 도출
                     logger.info(f"대상 스캔 중: {target}")
                     self.nm.scan(target, arguments='-sS -sV -T4 --top-ports 1000')
-
-                    # # 스캔 결과 로깅 (존재 여부 확인 후)
-                    # if target in self.nm.all_hosts():
-                    #     logger.info(f"Nmap 스캔 결과 ({target}): {self.nm[target]}")
-                    # else:
-                    #     logger.warning(f"Nmap 스캔 후 {target}에 대한 결과를 찾을 수 없습니다.")
 
                     # 결과 구조 초기화
                     result = {
@@ -394,7 +398,7 @@ class SecurityScanner:
                 
                 # 연결 정보가 포함된 텍스트 파일을 "스크린샷"으로 생성
                 screenshot_path = f"{self.screenshot_dir}/{target}_ssh_port_{port}.txt"
-                with open(screenshot_path, 'w') as f:
+                with open(screenshot_path, 'w', encoding='utf-8') as f:
                     f.write(f"{target}의 포트 {port}에 대한 SSH 연결 확인됨\n")
                     f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
                     f.write("테스트 자격 증명으로 인증 실패 (예상된 동작)\n")
@@ -440,7 +444,7 @@ class SecurityScanner:
                     
                     # 연결 정보가 포함된 텍스트 파일을 "스크린샷"으로 생성
                     screenshot_path = f"{self.screenshot_dir}/{target}_rdp_port_{port}.txt"
-                    with open(screenshot_path, 'w') as f:
+                    with open(screenshot_path, 'w', encoding='utf-8') as f:
                         f.write(f"{target}의 포트 {port}에 대한 RDP 연결 확인됨\n")
                         f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
                         f.write(f"초기 핸드셰이크에서 {len(initial_data)} 바이트 수신\n")
@@ -467,7 +471,7 @@ class SecurityScanner:
             is_https: HTTPS 프로토콜 사용 여부
             
         Returns:
-            포트별 스크린샷 파일 경로를 포함하는 Dictionary
+            포트별 스크린샷 또는 오류 파일 경로를 포함하는 Dictionary
         """
         protocol = "https" if is_https else "http"
         screenshots = {}
@@ -475,6 +479,14 @@ class SecurityScanner:
         # 웹드라이버가 초기화되지 않은 경우
         if self.driver is None:
             logger.error("웹드라이버가 초기화되지 않았습니다. 웹 스크린샷을 캡처할 수 없습니다.")
+            # 모든 포트에 대해 오류 파일 생성
+            for port in ports:
+                error_path = f"{self.screenshot_dir}/{target}_{protocol}_port_{port}_error.txt"
+                with open(error_path, 'w', encoding='utf-8') as f:
+                    f.write(f"{target}의 포트 {port}에 대한 {protocol.upper()} 접속 오류\n")
+                    f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
+                    f.write("오류: 웹드라이버가 초기화되지 않았습니다.\n")
+                screenshots[port] = error_path
             return screenshots
         
         for port in ports:
@@ -502,15 +514,62 @@ class SecurityScanner:
                     screenshots[port] = screenshot_path
                 else:
                     logger.warning(f"{url}에 대해 상태 코드 {response.status_code} 수신")
+                    # HTTP 에러 상태 코드를 파일로 저장
+                    error_path = f"{self.screenshot_dir}/{target}_{protocol}_port_{port}_error.txt"
+                    with open(error_path, 'w', encoding='utf-8') as f:
+                        f.write(f"{target}의 포트 {port}에 대한 {protocol.upper()} 접속 오류\n")
+                        f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
+                        f.write(f"URL: {url}\n")
+                        f.write(f"상태 코드: {response.status_code}\n")
+                        f.write(f"응답 메시지: {response.reason}\n")
+                    screenshots[port] = error_path
                     
             except requests.RequestException as e:
                 logger.error(f"{url}에 대한 요청 오류: {e}")
+                # 연결 오류 정보를 파일로 저장
+                error_path = f"{self.screenshot_dir}/{target}_{protocol}_port_{port}_error.txt"
+                with open(error_path, 'w', encoding='utf-8') as f:
+                    f.write(f"{target}의 포트 {port}에 대한 {protocol.upper()} 접속 오류\n")
+                    f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
+                    f.write(f"URL: {url}\n")
+                    f.write(f"오류 유형: {type(e).__name__}\n")
+                    f.write(f"오류 메시지: {str(e)}\n")
+                    
+                    # 특정 오류 유형에 대한 추가 정보
+                    if isinstance(e, requests.ConnectionError):
+                        f.write("상세: 연결을 설정할 수 없습니다. 대상 호스트가 응답하지 않거나 포트가 닫혀 있습니다.\n")
+                    elif isinstance(e, requests.Timeout):
+                        f.write("상세: 연결 시간이 초과되었습니다. 네트워크 지연이 발생했거나 대상 시스템이 느리게 응답합니다.\n")
+                    elif isinstance(e, requests.TooManyRedirects):
+                        f.write("상세: 너무 많은 리다이렉션이 발생했습니다. 웹 서버 구성 문제일 수 있습니다.\n")
+                    elif isinstance(e, requests.SSLError):
+                        f.write("상세: SSL/TLS 인증서 검증에 실패했습니다. 인증서가 유효하지 않거나 자체 서명된 인증서일 수 있습니다.\n")
+                        
+                screenshots[port] = error_path
                 
             except WebDriverException as e:
                 logger.error(f"{url}에 대한 웹드라이버 오류: {e}")
+                # 웹드라이버 오류 정보를 파일로 저장
+                error_path = f"{self.screenshot_dir}/{target}_{protocol}_port_{port}_error.txt"
+                with open(error_path, 'w', encoding='utf-8') as f:
+                    f.write(f"{target}의 포트 {port}에 대한 {protocol.upper()} 접속 오류\n")
+                    f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
+                    f.write(f"URL: {url}\n")
+                    f.write(f"오류 유형: WebDriverException\n")
+                    f.write(f"오류 메시지: {str(e)}\n")
+                screenshots[port] = error_path
                 
             except Exception as e:
                 logger.error(f"{url}에 대한 스크린샷 캡처 중 예상치 못한 오류: {e}")
+                # 예상치 못한 오류 정보를 파일로 저장
+                error_path = f"{self.screenshot_dir}/{target}_{protocol}_port_{port}_error.txt"
+                with open(error_path, 'w', encoding='utf-8') as f:
+                    f.write(f"{target}의 포트 {port}에 대한 {protocol.upper()} 접속 오류\n")
+                    f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n")
+                    f.write(f"URL: {url}\n")
+                    f.write(f"오류 유형: {type(e).__name__}\n")
+                    f.write(f"오류 메시지: {str(e)}\n")
+                screenshots[port] = error_path
                 
         return screenshots
 
@@ -674,14 +733,27 @@ class SecurityScanner:
         서비스 접근성을 확인하고 스크린샷을 캡처합니다.
                 
         Args:
+<<<<<<< HEAD
             scan_result: nmap 스캔 결과 딕셔너리
+=======
+            scan_result: 초기 포트 스캔 결과에서 생성된 상세 스캔 결과 구조
+>>>>>>> 101a709 (Update security_scanner.py)
             
         Returns:
             스크린샷 경로로 업데이트된 스캔 결과 딕셔너리
         """
         target = scan_result['ip']
         logger.info(f"{target}에 대한 서비스 확인 중")
+<<<<<<< HEAD
      
+=======
+        
+        # 호스트가 응답했는지 확인
+        if not scan_result['responsive']:
+            logger.info(f"{target}은(는) 응답하지 않는 호스트입니다. 서비스 확인을 건너뜁니다.")
+            return scan_result
+        
+>>>>>>> 101a709 (Update security_scanner.py)
         # SSH 확인 (감지된 모든 포트)
         if scan_result['ssh']['open'] and scan_result['ssh']['ports']:
             scan_result['ssh']['screenshots'] = self.capture_ssh_screenshot(target, scan_result['ssh']['ports'])
@@ -712,7 +784,7 @@ class SecurityScanner:
         """스캔 결과의 Markdown 보고서를 생성합니다."""
         report_path = f"{self.result_dir}/result_{self.current_date}.md"
         
-        with open(report_path, 'w') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             f.write(f"# 보안 스캔 보고서\n\n")
             f.write(f"**날짜:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             
@@ -787,12 +859,23 @@ class SecurityScanner:
                     http_ports = ", ".join(map(str, result['http']['ports']))
                     f.write(f"상태: **열림** (포트: {http_ports})\n\n")
                     
-                    # 각 HTTP 포트에 대한 스크린샷
-                    for port, screenshot_path in result['http']['screenshots'].items():
-                        if screenshot_path:
-                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
-                            f.write(f"**포트 {port}의 HTTP 스크린샷:**\n\n")
-                            f.write(f"![HTTP 포트 {port} 스크린샷]({rel_path})\n\n")
+                    # 각 HTTP 포트에 대한 결과 처리 (스크린샷 또는 오류)
+                    for port, file_path in result['http']['screenshots'].items():
+                        if file_path:
+                            rel_path = os.path.relpath(file_path, self.result_dir)
+                            if file_path.endswith('.png'):
+                                # 스크린샷 처리
+                                f.write(f"**포트 {port}의 HTTP 스크린샷:**\n\n")
+                                f.write(f"![HTTP 포트 {port} 스크린샷]({rel_path})\n\n")
+                            elif file_path.endswith('_error.txt'):
+                                # 오류 메시지 처리
+                                f.write(f"**포트 {port}의 HTTP 연결 오류:**\n\n")
+                                try:
+                                    with open(file_path, 'r', encoding='utf-8') as error_file:
+                                        error_content = error_file.read()
+                                    f.write(f"```\n{error_content}```\n\n")
+                                except Exception as e:
+                                    f.write(f"오류 파일을 읽을 수 없습니다: {e}\n\n")
                 else:
                     f.write("상태: **닫힘**\n\n")
                 
@@ -802,12 +885,23 @@ class SecurityScanner:
                     https_ports = ", ".join(map(str, result['https']['ports']))
                     f.write(f"상태: **열림** (포트: {https_ports})\n\n")
                     
-                    # 각 HTTPS 포트에 대한 스크린샷
-                    for port, screenshot_path in result['https']['screenshots'].items():
-                        if screenshot_path:
-                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
-                            f.write(f"**포트 {port}의 HTTPS 스크린샷:**\n\n")
-                            f.write(f"![HTTPS 포트 {port} 스크린샷]({rel_path})\n\n")
+                    # 각 HTTPS 포트에 대한 결과 처리 (스크린샷 또는 오류)
+                    for port, file_path in result['https']['screenshots'].items():
+                        if file_path:
+                            rel_path = os.path.relpath(file_path, self.result_dir)
+                            if file_path.endswith('.png'):
+                                # 스크린샷 처리
+                                f.write(f"**포트 {port}의 HTTPS 스크린샷:**\n\n")
+                                f.write(f"![HTTPS 포트 {port} 스크린샷]({rel_path})\n\n")
+                            elif file_path.endswith('_error.txt'):
+                                # 오류 메시지 처리
+                                f.write(f"**포트 {port}의 HTTPS 연결 오류:**\n\n")
+                                try:
+                                    with open(file_path, 'r', encoding='utf-8') as error_file:
+                                        error_content = error_file.read()
+                                    f.write(f"```\n{error_content}```\n\n")
+                                except Exception as e:
+                                    f.write(f"오류 파일을 읽을 수 없습니다: {e}\n\n")
                 else:
                     f.write("상태: **닫힘**\n\n")
 
@@ -848,7 +942,7 @@ class SecurityScanner:
         """스캔 결과의 HTML 보고서를 생성합니다."""
         report_path = f"{self.result_dir}/result_{self.current_date}.html"
         
-        with open(report_path, 'w') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             f.write("""
             <!DOCTYPE html>
             <html lang="ko">
@@ -890,6 +984,10 @@ class SecurityScanner:
                     .status-closed {
                         color: red;
                     }
+                    .status-error {
+                        color: orange;
+                        font-weight: bold;
+                    }
                     .status-nonresponsive {
                         color: gray;
                         font-style: italic;
@@ -913,6 +1011,14 @@ class SecurityScanner:
                         margin: 10px 0 20px 20px;
                         padding: 10px;
                         border-left: 3px solid #eee;
+                    }
+                    .error-detail {
+                        background-color: #fff3f3;
+                        border-left: 3px solid #ffcccc;
+                        padding: 10px;
+                        margin: 10px 0;
+                        white-space: pre-wrap;
+                        font-family: monospace;
                     }
                 </style>
             </head>
@@ -1004,7 +1110,7 @@ class SecurityScanner:
                     # 각 SSH 포트에 대한 연결 세부 정보
                     for port, screenshot_path in result['ssh']['screenshots'].items():
                         if screenshot_path:
-                            with open(screenshot_path, 'r') as ssh_file:
+                            with open(screenshot_path, 'r', encoding='utf-8') as ssh_file:
                                 ssh_details = ssh_file.read()
                             f.write(f"""
                             <div class="service-detail">
@@ -1030,7 +1136,7 @@ class SecurityScanner:
                     # 각 RDP 포트에 대한 연결 세부 정보
                     for port, screenshot_path in result['rdp']['screenshots'].items():
                         if screenshot_path:
-                            with open(screenshot_path, 'r') as rdp_file:
+                            with open(screenshot_path, 'r', encoding='utf-8') as rdp_file:
                                 rdp_details = rdp_file.read()
                             f.write(f"""
                             <div class="service-detail">
@@ -1053,16 +1159,35 @@ class SecurityScanner:
                     <p class="status-open">상태: 열림 <span class="port-info">(포트: {http_ports})</span></p>
                     """)
                     
-                    # 각 HTTP 포트에 대한 스크린샷
-                    for port, screenshot_path in result['http']['screenshots'].items():
-                        if screenshot_path:
-                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
-                            f.write(f"""
-                            <div class="service-detail">
-                                <h5>포트 {port}의 HTTP 스크린샷</h5>
-                                <img src="{rel_path}" alt="HTTP 포트 {port} 스크린샷">
-                            </div>
-                            """)
+                    # 각 HTTP 포트에 대한 결과 처리 (스크린샷 또는 오류)
+                    for port, file_path in result['http']['screenshots'].items():
+                        if file_path:
+                            rel_path = os.path.relpath(file_path, self.result_dir)
+                            if file_path.endswith('.png'):
+                                # 스크린샷 처리
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 HTTP 스크린샷</h5>
+                                    <img src="{rel_path}" alt="HTTP 포트 {port} 스크린샷">
+                                </div>
+                                """)
+                            elif file_path.endswith('_error.txt'):
+                                # 오류 메시지 처리
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5 class="status-error">포트 {port}의 HTTP 연결 오류</h5>
+                                """)
+                                try:
+                                    with open(file_path, 'r', encoding='utf-8') as error_file:
+                                        error_content = error_file.read()
+                                    f.write(f"""
+                                    <div class="error-detail">{error_content}</div>
+                                    """)
+                                except Exception as e:
+                                    f.write(f"""
+                                    <div class="error-detail">오류 파일을 읽을 수 없습니다: {e}</div>
+                                    """)
+                                f.write("</div>")
                 else:
                     f.write("""
                     <p class="status-closed">상태: 닫힘</p>
@@ -1078,16 +1203,35 @@ class SecurityScanner:
                     <p class="status-open">상태: 열림 <span class="port-info">(포트: {https_ports})</span></p>
                     """)
                     
-                    # 각 HTTPS 포트에 대한 스크린샷
-                    for port, screenshot_path in result['https']['screenshots'].items():
-                        if screenshot_path:
-                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
-                            f.write(f"""
-                            <div class="service-detail">
-                                <h5>포트 {port}의 HTTPS 스크린샷</h5>
-                                <img src="{rel_path}" alt="HTTPS 포트 {port} 스크린샷">
-                            </div>
-                            """)
+                    # 각 HTTPS 포트에 대한 결과 처리 (스크린샷 또는 오류)
+                    for port, file_path in result['https']['screenshots'].items():
+                        if file_path:
+                            rel_path = os.path.relpath(file_path, self.result_dir)
+                            if file_path.endswith('.png'):
+                                # 스크린샷 처리
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 HTTPS 스크린샷</h5>
+                                    <img src="{rel_path}" alt="HTTPS 포트 {port} 스크린샷">
+                                </div>
+                                """)
+                            elif file_path.endswith('_error.txt'):
+                                # 오류 메시지 처리
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5 class="status-error">포트 {port}의 HTTPS 연결 오류</h5>
+                                """)
+                                try:
+                                    with open(file_path, 'r', encoding='utf-8') as error_file:
+                                        error_content = error_file.read()
+                                    f.write(f"""
+                                    <div class="error-detail">{error_content}</div>
+                                    """)
+                                except Exception as e:
+                                    f.write(f"""
+                                    <div class="error-detail">오류 파일을 읽을 수 없습니다: {e}</div>
+                                    """)
+                                f.write("</div>")
                 else:
                     f.write("""
                     <p class="status-closed">상태: 닫힘</p>
@@ -1189,17 +1333,26 @@ class SecurityScanner:
         """스캔 결과의 CSV 보고서를 생성합니다."""
         report_path = f"{self.result_dir}/result_{self.current_date}.csv"
         
-        with open(report_path, 'w', newline='') as f:
+        with open(report_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
+<<<<<<< HEAD
             # CSV 헤더에 SMB, FTP 추가
             writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTPS', 'HTTPS_포트', 'SMB', 'SMB_포트', 'FTP', 'FTP_포트'])
+=======
+            writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTP_오류', 'HTTPS', 'HTTPS_포트', 'HTTPS_오류'])
+>>>>>>> 101a709 (Update security_scanner.py)
             
             for target, result in self.scan_results.items():
                 responsive_status = "Y" if result.get('responsive', False) else "N"
                 
                 if not result.get('responsive', False):
+<<<<<<< HEAD
                     # 비응답 호스트는 모든 서비스가 닫힘 (SMB, FTP 포함)
                     writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "N", "", "N", "", "N", ""])
+=======
+                    # 비응답 호스트는 모든 서비스가 닫힘
+                    writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "", "N", "", ""])
+>>>>>>> 101a709 (Update security_scanner.py)
                     continue
                 
                 ssh_status = "Y" if result['ssh']['open'] else "N"
@@ -1210,9 +1363,29 @@ class SecurityScanner:
                 
                 http_status = "Y" if result['http']['open'] else "N"
                 http_ports = ";".join(map(str, result['http']['ports'])) if result['http']['ports'] else ""
+                http_errors = []
+                for port, file_path in result['http']['screenshots'].items():
+                    if file_path and file_path.endswith('_error.txt'):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as error_file:
+                                error_lines = error_file.readlines()
+                                # 오류 유형과 메시지만 추출
+                                error_type = ""
+                                error_msg = ""
+                                for line in error_lines:
+                                    if line.startswith("오류 유형:"):
+                                        error_type = line.split(":", 1)[1].strip()
+                                    elif line.startswith("오류 메시지:"):
+                                        error_msg = line.split(":", 1)[1].strip()
+                                if error_type or error_msg:
+                                    http_errors.append(f"Port {port}: {error_type} - {error_msg}")
+                        except Exception:
+                            http_errors.append(f"Port {port}: 오류 파일 읽기 실패")
+                http_error_str = "; ".join(http_errors) if http_errors else ""
                 
                 https_status = "Y" if result['https']['open'] else "N"
                 https_ports = ";".join(map(str, result['https']['ports'])) if result['https']['ports'] else ""
+<<<<<<< HEAD
 
                 # SMB 정보 추가
                 smb_status = "Y" if result['smb']['open'] else "N"
@@ -1221,21 +1394,47 @@ class SecurityScanner:
                 # FTP 정보 추가
                 ftp_status = "Y" if result['ftp']['open'] else "N"
                 ftp_ports = ";".join(map(str, result['ftp']['ports'])) if result['ftp']['ports'] else ""
+=======
+                https_errors = []
+                for port, file_path in result['https']['screenshots'].items():
+                    if file_path and file_path.endswith('_error.txt'):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as error_file:
+                                error_lines = error_file.readlines()
+                                # 오류 유형과 메시지만 추출
+                                error_type = ""
+                                error_msg = ""
+                                for line in error_lines:
+                                    if line.startswith("오류 유형:"):
+                                        error_type = line.split(":", 1)[1].strip()
+                                    elif line.startswith("오류 메시지:"):
+                                        error_msg = line.split(":", 1)[1].strip()
+                                if error_type or error_msg:
+                                    https_errors.append(f"Port {port}: {error_type} - {error_msg}")
+                        except Exception:
+                            https_errors.append(f"Port {port}: 오류 파일 읽기 실패")
+                https_error_str = "; ".join(https_errors) if https_errors else ""
+>>>>>>> 101a709 (Update security_scanner.py)
                 
                 writer.writerow([
                     target, 
                     responsive_status,
                     ssh_status, ssh_ports, 
                     rdp_status, rdp_ports, 
+<<<<<<< HEAD
                     http_status, http_ports, 
                     https_status, https_ports,
                     smb_status, smb_ports, # SMB 추가
                     ftp_status, ftp_ports  # FTP 추가
+=======
+                    http_status, http_ports, http_error_str,
+                    https_status, https_ports, https_error_str
+>>>>>>> 101a709 (Update security_scanner.py)
                 ])
         
         logger.info(f"CSV 보고서가 {report_path}에 생성되었습니다")
         return report_path
-    
+       
     def run(self):
         """전체 보안 스캔 프로세스를 실행합니다."""
         # 대상 읽기
