@@ -159,9 +159,6 @@ CIDR(Classless Inter-Domain Routing) 표기법을 사용하여 IP 범위를 지�
 - 서비스 감지의 정확도는 Nmap의 결과에 의존합니다. 일부 서비스는 정확하게 감지되지 않을 수 있습니다.
 - 대량의 IP 주소를 스캔할 때는 시스템 리소스와 네트워크 부하를 고려하세요.
 
-## 커스터마이징
+## 향후 개발 사항
+- FTP, Telnet, SMB지원
 
-- `scan_all_targets` 메서드 내 `self.nm.scan()` 호출 시 Nmap 스캔 옵션(`arguments`)을 조정하여 스캔 매개변수를 변경할 수 있습니다.
-- `scan_all_targets` 메서드 내 서비스 감지 로직을 수정하여 더 많은 서비스 유형을 지원하도록 확장할 수 있습니다.
-- `__init__` 메서드 내 `self.driver.set_window_size(1920, 1080)` 부분을 수정하여 스크린샷 해상도를 변경할 수 있습니다.
-- 스크립트 상단의 `logging.basicConfig` 설정을 변경하여 로깅 수준(`level`)이나 포맷(`format`)을 조정할 수 있습니다.
