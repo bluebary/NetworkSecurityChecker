@@ -61,22 +61,107 @@ pip install -r requirements.txt
     python security_scanner.py -t my_targets.txt
     ```
 
-## 결과물
+3. `result_YYYYMMDD_HHMMSS` 디렉토리에 생성된 보고서를 확인합니다:
+   - `result_YYYYMMDD_HHMMSS.md` - Markdown 보고서
+   - `result_YYYYMMDD_HHMMSS.html` - HTML 보고서
+   - `result_YYYYMMDD_HHMMSS.csv` - CSV 보고서
+   - `screenshots/` - 캡처된 모든 스크린샷이 포함된 디렉토리
 
-스캔이 완료되면 현재 날짜와 시간으로 명명된 `result_YYYYMMDD_HHMMSS` 형식의 디렉토리가 생성됩니다. 이 디렉토리에는 다음 파일들이 포함됩니다:
+## CSV 보고서 형식
 
-*   `result_YYYYMMDD_HHMMSS.md`: Markdown 형식의 스캔 보고서
-*   `result_YYYYMMDD_HHMMSS.html`: HTML 형식의 스캔 보고서
-*   `result_YYYYMMDD_HHMMSS.csv`: CSV 형식의 스캔 보고서
-*   `screenshots/`:
-    *   HTTP/HTTPS 서비스의 스크린샷 이미지 파일 (`.png`)
-    *   SSH/RDP/SMB/FTP 서비스 점검 결과 텍스트 파일 (`.txt`)
+CSV 보고서는 다음 열을 포함합니다:
+- IP: 대상 IP 주소
+- 응답: 호스트가 스캔에 응답했는지 여부 (Y/N)
+- SSH: SSH 서비스가 열려 있는지 여부 (Y/N)
+- SSH_포트: 감지된 SSH 포트 목록 (세미콜론으로 구분)
+- RDP: RDP 서비스가 열려 있는지 여부 (Y/N)
+- RDP_포트: 감지된 RDP 포트 목록 (세미콜론으로 구분)
+- HTTP: HTTP 서비스가 열려 있는지 여부 (Y/N)
+- HTTP_포트: 감지된 HTTP 포트 목록 (세미콜론으로 구분)
+- HTTPS: HTTPS 서비스가 열려 있는지 여부 (Y/N)
+- HTTPS_포트: 감지된 HTTPS 포트 목록 (세미콜론으로 구분)
 
-또한, 스크립트 실행 디렉토리에 `security_scan.log` 파일이 생성되어 스캔 과정의 로그를 기록합니다.
+## 증적 파일
 
-## 주의 사항
+- SSH: 연결 세부 정보가 포함된 텍스트 파일 (포트별로 생성)
+- RDP: 연결 세부 정보가 포함된 텍스트 파일 (포트별로 생성)
+- HTTP/HTTPS: 웹 페이지의 PNG 이미지 (포트별로 생성)
 
-*   이 스크립트는 대상 시스템에 대한 명시적인 허가를 받은 후에만 사용해야 합니다. 무단 스캔은 불법일 수 있습니다.
-*   매우 큰 네트워크 범위 (예: `/16` 이상)를 스캔 대상으로 지정하면 시간이 매우 오래 걸릴 수 있습니다.
-*   웹드라이버 설정에 문제가 있을 경우 웹 스크린샷 기능이 작동하지 않을 수 있습니다.
-*   SMB/FTP 익명 접속 시도는 실제 환경 및 권한 설정에 따라 결과가 다를 수 있습니다.
+## 코드 설명
+
+### 주요 클래스 및 함수
+
+- `SecurityScanner`: 메인 스캐너 클래스
+  - `__init__()`: 스캐너 초기화 (결과 디렉토리, Nmap, 웹드라이버 설정)
+  - `parse_target()`: 단일 대상 문자열(IP, 호스트명, CIDR)을 IP 주소 목록으로 파싱
+  - `read_targets()`: 대상 파일(`target_file`)을 읽어 전체 대상 IP 목록 생성
+  - `scan_all_targets()`: 모든 대상에 대해 초기 Nmap 포트 스캔 수행 및 서비스 감지
+  - `prepare_detailed_scan()`: 초기 스캔 결과를 상세 점검용 구조로 변환
+  - `capture_ssh_screenshot()`: SSH 연결 시도 및 텍스트 증적 생성
+  - `capture_rdp_screenshot()`: RDP 연결 시도 및 텍스트 증적 생성
+  - `capture_web_screenshot()`: 웹 페이지 접속 및 스크린샷(PNG) 캡처
+  - `check_services()`: 감지된 서비스 포트에 대해 `capture_*` 메서드 호출하여 상세 점검 수행
+  - `generate_markdown_report()`: Markdown 형식 보고서 생성
+  - `generate_html_report()`: HTML 형식 보고서 생성
+  - `generate_csv_report()`: CSV 형식 보고서 생성
+  - `run()`: 전체 스캔 워크플로우 실행 (대상 읽기 -> 초기 스캔 -> 상세 점검 -> 보고서 생성)
+
+### 워크플로우
+
+1. 대상 파일(`target_file`)에서 IP 주소, 호스트명, CIDR 표기법 읽기
+2. CIDR 표기법을 개별 IP 주소로 확장하여 전체 대상 목록 생성
+3. 모든 대상에 대해 초기 Nmap 스캔 수행 (`-sS -sV -T4 --top-ports 1000`)하여 응답 여부 및 열린 포트, 서비스 정보 확인
+4. 스캔 결과 분석하여 각 대상별 SSH, RDP, HTTP, HTTPS 서비스 및 해당 포트 식별 (비표준 포트 포함)
+5. 응답한 호스트에 대해서만 상세 점검 수행:
+   - 식별된 각 서비스 포트에 대해 연결 시도 (SSH, RDP) 또는 웹 접속 (HTTP, HTTPS)
+   - 연결/접속 성공 시 증적 생성 (SSH/RDP는 텍스트 파일, HTTP/HTTPS는 PNG 스크린샷)
+6. 모든 대상(응답/비응답 포함)의 결과를 종합하여 Markdown, HTML, CSV 보고서 생성
+
+## CIDR 표기법 지원
+
+CIDR(Classless Inter-Domain Routing) 표기법을 사용하여 IP 범위를 지정할 수 있습니다:
+
+- 예: `192.168.1.0/24`는 192.168.1.0부터 192.168.1.255까지의 256개 IP 주소를 의미합니다.
+- 예: `10.0.0.0/28`은 10.0.0.0부터 10.0.0.15까지의 16개 IP 주소를 의미합니다.
+
+스크립트는 Python의 `ipaddress` 모듈을 사용하여 CIDR 표기법을 처리합니다:
+
+1. 입력 파일의 각 줄이 CIDR 표기법인지 확인
+2. CIDR 표기법인 경우 해당 네트워크 내의 모든 IP 주소 생성
+3. 생성된 모든 IP 주소를 대상 목록에 추가
+
+**주의사항**: 너무 큰 네트워크 범위(예: /16 이상)를 지정하면 스캔 시간이 매우 오래 걸릴 수 있습니다. 스크립트는 네트워크 크기가 256개 이상인 경우 경고 메시지를 출력합니다.
+
+## 비표준 포트 감지 방식
+
+이 스크립트는 표준 포트뿐만 아니라 모든 포트에서 실행 중인 서비스를 감지할 수 있습니다:
+
+1. **서비스 감지 방법**:
+   - Nmap의 서비스 버전 감지(-sV) 옵션을 사용하여 각 포트에서 실행 중인 서비스 식별
+   - 서비스 이름과 제품 정보를 분석하여 SSH, RDP, HTTP, HTTPS 서비스 감지
+   - 비표준 포트에서 실행 중인 서비스도 자동으로 감지
+
+2. **서비스별 특징 식별**:
+   - SSH: 'ssh'라는 문자열이 서비스 이름에 포함된 포트
+   - RDP: 'ms-wbt-server', 'rdp', 'remote desktop', 'msrdp' 등의 문자열이 서비스 이름이나 제품 정보에 포함된 포트
+   - HTTP: 'http'라는 문자열이 포함되고, 'https', 'ssl', 'tls' 등의 보안 관련 문자열이 포함되지 않은 포트
+   - HTTPS: 'https', 'ssl/http', 'http-over-ssl' 등의 문자열이 서비스 이름에 포함된 포트
+
+3. **연결 테스트**:
+   - 각 서비스의 모든 감지된 포트에 대해 개별적으로 연결 테스트 수행
+   - 각 포트별로 별도의 증적 파일 생성
+
+## 문제 해결
+
+- 웹드라이버 문제가 발생하는 경우, Chrome 또는 Firefox가 시스템에 설치되어 있는지 확인하세요.
+- 자세한 오류 정보는 `security_scan.log` 로그 파일을 확인하세요.
+- SSH/RDP 연결 확인 시 실제로 로그인하지는 않으며, 연결 가능 여부만 확인합니다.
+- 서비스 감지의 정확도는 Nmap의 결과에 의존합니다. 일부 서비스는 정확하게 감지되지 않을 수 있습니다.
+- 대량의 IP 주소를 스캔할 때는 시스템 리소스와 네트워크 부하를 고려하세요.
+
+## 커스터마이징
+
+- `scan_all_targets` 메서드 내 `self.nm.scan()` 호출 시 Nmap 스캔 옵션(`arguments`)을 조정하여 스캔 매개변수를 변경할 수 있습니다.
+- `scan_all_targets` 메서드 내 서비스 감지 로직을 수정하여 더 많은 서비스 유형을 지원하도록 확장할 수 있습니다.
+- `__init__` 메서드 내 `self.driver.set_window_size(1920, 1080)` 부분을 수정하여 스크린샷 해상도를 변경할 수 있습니다.
+- 스크립트 상단의 `logging.basicConfig` 설정을 변경하여 로깅 수준(`level`)이나 포맷(`format`)을 조정할 수 있습니다.
