@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import argparse, csv, datetime, logging, os, socket, sys, time, nmap, paramiko, requests, ipaddress
+import argparse, csv, datetime, logging, os, socket, sys, time, nmap, paramiko, requests, ipaddress, ftplib
 from typing import Dict, List, Optional, Union, Set, Any, Tuple
+from smbclient import SambaClient as smbclient, SambaClientError as SmbClientError 
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -32,8 +33,8 @@ class SecurityScanner:
         """
         self.target_file = target_file
         self.targets = []
-        self.scan_results = {}
-        self.responsive_hosts = {}  # 포트 스캔 결과를 저장할 딕셔너리
+        self.scan_results = {} # 최종 상세 결과를 저장할 딕셔너리
+        self.responsive_hosts = {}  # 초기 포트 스캔 결과를 저장할 딕셔너리
         self.current_date = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.result_dir = f"result_{self.current_date}"
         self.screenshot_dir = f"{self.result_dir}/screenshots"
@@ -163,7 +164,9 @@ class SecurityScanner:
                         'ssh': {'open': False, 'ports': []},
                         'rdp': {'open': False, 'ports': []},
                         'http': {'open': False, 'ports': []},
-                        'https': {'open': False, 'ports': []}
+                        'https': {'open': False, 'ports': []},
+                        'smb': {'open': False, 'ports': []}, # SMB 추가
+                        'ftp': {'open': False, 'ports': []}  # FTP 추가
                     }
                     
                     # 대상이 실제로 스캔되었는지 확인
@@ -213,6 +216,18 @@ class SecurityScanner:
                                 result['https']['ports'].append(port)
                                 logger.info(f"{target}에서 포트 {port}에 HTTPS 서비스 감지됨")
                             
+                            # SMB 서비스 확인 (포트 445 또는 서비스 이름)
+                            if port == 445 or 'microsoft-ds' in service_name:
+                                result['smb']['open'] = True
+                                result['smb']['ports'].append(port)
+                                logger.info(f"{target}에서 포트 {port}에 SMB 서비스 감지됨")
+
+                            # FTP 서비스 확인
+                            if 'ftp' in service_name:
+                                result['ftp']['open'] = True
+                                result['ftp']['ports'].append(port)
+                                logger.info(f"{target}에서 포트 {port}에 FTP 서비스 감지됨")
+                            
                             # HTTP/HTTPS 추가 확인 (제품 이름이나 버전 정보 사용)
                             if ('http' in product or 'web' in product or 'apache' in product or
                                 'nginx' in product or 'iis' in product):
@@ -260,10 +275,23 @@ class SecurityScanner:
                         result['https']['open'] = True
                         result['https']['ports'].append(443)
                         logger.info(f"{target}에서 기본 포트 443에 HTTPS 서비스 감지됨 (서비스 이름 정보 없음)")
+
+                    # 표준 포트 확인 (포트 445의 SMB)
+                    if 'tcp' in host_data and 445 in host_data['tcp'] and host_data['tcp'][445]['state'] == 'open' and not result['smb']['ports']:
+                        result['smb']['open'] = True
+                        result['smb']['ports'].append(445)
+                        logger.info(f"{target}에서 기본 포트 445에 SMB 서비스 감지됨 (서비스 이름 정보 없음)")
+
+                    # 표준 포트 확인 (포트 21의 FTP)
+                    if 'tcp' in host_data and 21 in host_data['tcp'] and host_data['tcp'][21]['state'] == 'open' and not result['ftp']['ports']:
+                        result['ftp']['open'] = True
+                        result['ftp']['ports'].append(21)
+                        logger.info(f"{target}에서 기본 포트 21에 FTP 서비스 감지됨 (서비스 이름 정보 없음)")
                     
                     # 모든 서비스의 포트 정렬
-                    for service in ['ssh', 'rdp', 'http', 'https']:
-                        result[service]['ports'] = sorted(result[service]['ports'])
+                    for service in ['ssh', 'rdp', 'http', 'https', 'smb', 'ftp']:
+                        if service in result: # 서비스 키가 존재하는지 확인
+                            result[service]['ports'] = sorted(list(set(result[service]['ports']))) # 중복 제거 및 정렬
                     
                     results[target] = result
                     
@@ -275,7 +303,9 @@ class SecurityScanner:
                         'ssh': {'open': False, 'ports': []},
                         'rdp': {'open': False, 'ports': []},
                         'http': {'open': False, 'ports': []},
-                        'https': {'open': False, 'ports': []}
+                        'https': {'open': False, 'ports': []},
+                        'smb': {'open': False, 'ports': []}, # SMB 추가
+                        'ftp': {'open': False, 'ports': []}  # FTP 추가
                     }
         
         # 응답한 호스트 수 계산
@@ -315,6 +345,16 @@ class SecurityScanner:
             'https': {
                 'open': scan_info['https']['open'],
                 'ports': scan_info['https']['ports'].copy(),
+                'screenshots': {}
+            },
+            'smb': { # SMB 추가
+                'open': scan_info.get('smb', {}).get('open', False), # scan_info에 smb 키가 없을 경우 대비
+                'ports': scan_info.get('smb', {}).get('ports', []).copy(),
+                'screenshots': {}
+            },
+            'ftp': { # FTP 추가
+                'open': scan_info.get('ftp', {}).get('open', False), # scan_info에 ftp 키가 없을 경우 대비
+                'ports': scan_info.get('ftp', {}).get('ports', []).copy(),
                 'screenshots': {}
             }
         }
@@ -473,20 +513,175 @@ class SecurityScanner:
                 logger.error(f"{url}에 대한 스크린샷 캡처 중 예상치 못한 오류: {e}")
                 
         return screenshots
-    
+
+    def capture_smb_screenshot(self, target: str, ports: List[int]) -> Dict[int, str]:
+        """
+        SMB 익명 접속을 시도하고 성공 시 공유 목록/파일 목록을 캡처합니다.
+
+        Args:
+            target: SMB 서버의 IP 주소
+            ports: 확인할 SMB 포트 목록 (주로 445)
+
+        Returns:
+            포트별 익명 접속 결과 파일 경로를 포함하는 Dictionary
+        """
+        screenshots = {}
+        if smbclient is None:
+            logger.error("smbclient 라이브러리가 설치되지 않아 SMB 스캔을 건너<0xEB><0x9B><0x84>니다.")
+            return screenshots
+
+        for port in ports:
+            logger.info(f"{target}의 포트 {port}에 대한 SMB 익명 접속 시도 중")
+            screenshot_path = f"{self.screenshot_dir}/{target}_smb_port_{port}_anon_access.txt"
+            
+            try:
+                # 익명 접속 시도 (사용자 이름과 비밀번호 없이)
+                # smbclient.ClientConfig(username=None, password=None) # 명시적으로 None 설정 시도 (라이브러리 버전에 따라 필요할 수 있음)
+                
+                # 서버에 등록된 공유 목록 가져오기 시도
+                shares = smbclient.listdir(f"//{target}", port=port, username=None, password=None)
+                
+                logger.info(f"{target}:{port} SMB 익명 접속 성공. 공유 목록 가져옴.")
+                
+                # 공유 목록 및 기본 파일 목록 저장
+                with open(screenshot_path, 'w') as f:
+                    f.write(f"SMB 익명 접속 성공 ({target}:{port})\n")
+                    f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n\n")
+                    f.write("공유 목록:\n")
+                    if shares:
+                        for share in shares:
+                            f.write(f"- {share}\n")
+                            # 루트 디렉토리 파일 목록 가져오기 시도 (제한적일 수 있음)
+                            try:
+                                share_path = f"//{target}/{share}"
+                                files = smbclient.listdir(share_path, port=port, username=None, password=None)
+                                f.write(f"  \\_ 파일/디렉토리 ({len(files)}개):\n")
+                                for item in files[:10]: # 너무 많을 경우 일부만 표시
+                                    f.write(f"    - {item}\n")
+                                if len(files) > 10:
+                                    f.write("    - ... (더 많은 항목 존재)\n")
+                            except SmbClientError as e:
+                                f.write(f"  \\_ 공유 '{share}'의 파일 목록 가져오기 실패: {e}\n")
+                            except Exception as e:
+                                f.write(f"  \\_ 공유 '{share}'의 파일 목록 가져오기 중 예상치 못한 오류: {e}\n")
+                    else:
+                        f.write("- 공유 목록을 가져올 수 없거나 비어 있습니다.\n")
+                
+                screenshots[port] = screenshot_path
+                
+            except SmbClientError as e:
+                # 일반적인 익명 접속 실패 오류 처리
+                # 에러 코드나 메시지로 더 상세히 구분 가능 (예: 'NT_STATUS_ACCESS_DENIED')
+                if "NT_STATUS_ACCESS_DENIED" in str(e) or "LOGON_FAILURE" in str(e):
+                     logger.info(f"{target}:{port} SMB 익명 접속 실패 (예상된 동작): {e}")
+                elif "NT_STATUS_CONNECTION_REFUSED" in str(e) or "Connection refused" in str(e):
+                     logger.error(f"{target}:{port} SMB 연결 거부됨: {e}")
+                elif "NT_STATUS_BAD_NETWORK_NAME" in str(e):
+                     logger.error(f"{target}:{port} SMB 잘못된 네트워크 이름: {e}")
+                else:
+                     logger.error(f"{target}:{port} SMB 클라이언트 오류: {e}")
+                     
+            except socket.timeout:
+                 logger.error(f"{target}:{port} SMB 연결 시간 초과")
+            except OSError as e:
+                 # 네트워크 관련 OS 오류 (예: "No route to host")
+                 logger.error(f"{target}:{port} SMB OS 오류: {e}")
+            except Exception as e:
+                logger.error(f"{target}:{port} SMB 익명 접속 확인 중 예상치 못한 오류: {e}")
+                
+        return screenshots
+
+    def capture_ftp_screenshot(self, target: str, ports: List[int]) -> Dict[int, str]:
+        """
+        FTP 익명 접속을 시도하고 성공 시 루트 디렉토리 목록을 캡처합니다.
+
+        Args:
+            target: FTP 서버의 IP 주소
+            ports: 확인할 FTP 포트 목록 (주로 21)
+
+        Returns:
+            포트별 익명 접속 결과 파일 경로를 포함하는 Dictionary
+        """
+        screenshots = {}
+
+        for port in ports:
+            logger.info(f"{target}의 포트 {port}에 대한 FTP 익명 접속 시도 중")
+            screenshot_path = f"{self.screenshot_dir}/{target}_ftp_port_{port}_anon_access.txt"
+            
+            try:
+                # FTP 연결 시도 (타임아웃 설정)
+                ftp = ftplib.FTP()
+                ftp.connect(target, port, timeout=10)
+                
+                # 익명 로그인 시도
+                ftp.login() # 사용자 'anonymous', 비밀번호 'anonymous@' 사용
+                
+                logger.info(f"{target}:{port} FTP 익명 접속 성공.")
+                
+                # 루트 디렉토리 목록 가져오기
+                dir_listing = []
+                try:
+                    # NLST는 파일/디렉토리 이름 목록만 반환 (더 안정적일 수 있음)
+                    dir_listing = ftp.nlst()
+                    # 또는 상세 목록: dir_listing = ftp.retrlines('LIST') # 이 경우 콜백 함수 필요
+                except ftplib.error_perm as e:
+                    logger.warning(f"{target}:{port} FTP 디렉토리 목록 가져오기 실패 (권한 오류 가능성): {e}")
+                    dir_listing.append(f"디렉토리 목록 가져오기 실패: {e}")
+                except Exception as e:
+                    logger.error(f"{target}:{port} FTP 디렉토리 목록 가져오기 중 오류: {e}")
+                    dir_listing.append(f"디렉토리 목록 가져오기 중 오류: {e}")
+
+                # 접속 성공 및 디렉토리 목록 저장
+                with open(screenshot_path, 'w') as f:
+                    f.write(f"FTP 익명 접속 성공 ({target}:{port})\n")
+                    f.write(f"타임스탬프: {datetime.datetime.now().isoformat()}\n\n")
+                    f.write("루트 디렉토리 목록:\n")
+                    if dir_listing:
+                        for item in dir_listing[:20]: # 너무 많을 경우 일부만 표시
+                            f.write(f"- {item}\n")
+                        if len(dir_listing) > 20:
+                            f.write("- ... (더 많은 항목 존재)\n")
+                    else:
+                        f.write("- 디렉토리 목록을 가져올 수 없거나 비어 있습니다.\n")
+                
+                screenshots[port] = screenshot_path
+                
+                # 연결 종료
+                ftp.quit()
+
+            except ftplib.error_perm as e:
+                # 로그인 실패 (530 Login incorrect 등)
+                logger.info(f"{target}:{port} FTP 익명 접속 실패 (로그인 거부됨): {e}")
+            except (socket.timeout, TimeoutError):
+                logger.error(f"{target}:{port} FTP 연결 시간 초과")
+            except (socket.error, ftplib.error_temp, ftplib.error_proto) as e:
+                # 연결 거부, 프로토콜 오류 등
+                logger.error(f"{target}:{port} FTP 연결 또는 프로토콜 오류: {e}")
+            except Exception as e:
+                logger.error(f"{target}:{port} FTP 익명 접속 확인 중 예상치 못한 오류: {e}")
+            finally:
+                # ftp 객체가 생성되었고 연결된 상태면 종료 시도
+                if 'ftp' in locals() and ftp.sock:
+                    try:
+                        ftp.quit()
+                    except Exception:
+                        pass # 이미 오류가 발생했거나 연결이 끊겼을 수 있음
+
+        return screenshots
+        
     def check_services(self, scan_result: Dict[str, Any]) -> Dict[str, Any]:
         """
         서비스 접근성을 확인하고 스크린샷을 캡처합니다.
-        
+                
         Args:
-            scan_result: nmap 스캔 결과
+            scan_result: nmap 스캔 결과 딕셔너리
             
         Returns:
-            스크린샷 경로로 업데이트된 스캔 결과
+            스크린샷 경로로 업데이트된 스캔 결과 딕셔너리
         """
         target = scan_result['ip']
         logger.info(f"{target}에 대한 서비스 확인 중")
-        
+     
         # SSH 확인 (감지된 모든 포트)
         if scan_result['ssh']['open'] and scan_result['ssh']['ports']:
             scan_result['ssh']['screenshots'] = self.capture_ssh_screenshot(target, scan_result['ssh']['ports'])
@@ -502,6 +697,14 @@ class SecurityScanner:
         # HTTPS 확인 (감지된 모든 포트)
         if scan_result['https']['open'] and scan_result['https']['ports']:
             scan_result['https']['screenshots'] = self.capture_web_screenshot(target, scan_result['https']['ports'], True)
+
+        # SMB 확인 (감지된 모든 포트)
+        if scan_result['smb']['open'] and scan_result['smb']['ports']:
+             scan_result['smb']['screenshots'] = self.capture_smb_screenshot(target, scan_result['smb']['ports'])
+
+        # FTP 확인 (감지된 모든 포트)
+        if scan_result['ftp']['open'] and scan_result['ftp']['ports']:
+             scan_result['ftp']['screenshots'] = self.capture_ftp_screenshot(target, scan_result['ftp']['ports'])
         
         return scan_result
     
@@ -518,8 +721,8 @@ class SecurityScanner:
             f.write(f"스캔된 총 대상: {len(self.scan_results)}\n")
             f.write(f"응답 호스트: {responsive_count}\n\n")
             
-            f.write("| IP 주소 | 응답 | SSH | RDP | HTTP | HTTPS |\n")
-            f.write("|------------|------|-----|-----|------|-------|\n")
+            f.write("| IP 주소 | 응답 | SSH | RDP | HTTP | HTTPS | SMB | FTP |\n") # SMB, FTP 추가
+            f.write("|------------|------|-----|-----|------|-------|-----|-----|\n") # SMB, FTP 추가
             
             for target, result in self.scan_results.items():
                 # 응답 상태 표시
@@ -533,8 +736,10 @@ class SecurityScanner:
                     rdp_status = f"✅ ({', '.join(map(str, result['rdp']['ports']))})" if result['rdp']['open'] else "❌"
                     http_status = f"✅ ({', '.join(map(str, result['http']['ports']))})" if result['http']['open'] else "❌"
                     https_status = f"✅ ({', '.join(map(str, result['https']['ports']))})" if result['https']['open'] else "❌"
+                    smb_status = f"✅ ({', '.join(map(str, result['smb']['ports']))})" if result['smb']['open'] else "❌" # SMB 추가
+                    ftp_status = f"✅ ({', '.join(map(str, result['ftp']['ports']))})" if result['ftp']['open'] else "❌" # FTP 추가
                 
-                f.write(f"| {target} | {responsive_status} | {ssh_status} | {rdp_status} | {http_status} | {https_status} |\n")
+                f.write(f"| {target} | {responsive_status} | {ssh_status} | {rdp_status} | {http_status} | {https_status} | {smb_status} | {ftp_status} |\n") # SMB, FTP 추가
             
             f.write("\n## 상세 결과\n\n")
             
@@ -603,6 +808,34 @@ class SecurityScanner:
                             rel_path = os.path.relpath(screenshot_path, self.result_dir)
                             f.write(f"**포트 {port}의 HTTPS 스크린샷:**\n\n")
                             f.write(f"![HTTPS 포트 {port} 스크린샷]({rel_path})\n\n")
+                else:
+                    f.write("상태: **닫힘**\n\n")
+
+                # SMB
+                f.write("#### SMB 서비스\n\n")
+                if result['smb']['open']:
+                    smb_ports = ", ".join(map(str, result['smb']['ports']))
+                    f.write(f"상태: **열림** (포트: {smb_ports})\n\n")
+                    
+                    # 각 SMB 포트에 대한 익명 접속 결과 링크
+                    for port, screenshot_path in result['smb']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"[포트 {port}의 SMB 익명 접속 결과]({rel_path})\n\n")
+                else:
+                    f.write("상태: **닫힘**\n\n")
+
+                # FTP
+                f.write("#### FTP 서비스\n\n")
+                if result['ftp']['open']:
+                    ftp_ports = ", ".join(map(str, result['ftp']['ports']))
+                    f.write(f"상태: **열림** (포트: {ftp_ports})\n\n")
+                    
+                    # 각 FTP 포트에 대한 익명 접속 결과 링크
+                    for port, screenshot_path in result['ftp']['screenshots'].items():
+                        if screenshot_path:
+                            rel_path = os.path.relpath(screenshot_path, self.result_dir)
+                            f.write(f"[포트 {port}의 FTP 익명 접속 결과]({rel_path})\n\n")
                 else:
                     f.write("상태: **닫힘**\n\n")
                 
@@ -703,6 +936,8 @@ class SecurityScanner:
                         <th>RDP</th>
                         <th>HTTP</th>
                         <th>HTTPS</th>
+                        <th>SMB</th> <!-- SMB 추가 -->
+                        <th>FTP</th> <!-- FTP 추가 -->
                     </tr>
             """)
             
@@ -718,6 +953,8 @@ class SecurityScanner:
                     rdp_status = f"✅ (포트: {', '.join(map(str, result['rdp']['ports']))})" if result['rdp']['open'] else "❌"
                     http_status = f"✅ (포트: {', '.join(map(str, result['http']['ports']))})" if result['http']['open'] else "❌"
                     https_status = f"✅ (포트: {', '.join(map(str, result['https']['ports']))})" if result['https']['open'] else "❌"
+                    smb_status = f"✅ (포트: {', '.join(map(str, result['smb']['ports']))})" if result['smb']['open'] else "❌" # SMB 추가
+                    ftp_status = f"✅ (포트: {', '.join(map(str, result['ftp']['ports']))})" if result['ftp']['open'] else "❌" # FTP 추가
                 
                 f.write(f"""
                     <tr>
@@ -727,6 +964,8 @@ class SecurityScanner:
                         <td>{rdp_status}</td>
                         <td>{http_status}</td>
                         <td>{https_status}</td>
+                        <td>{smb_status}</td> <!-- SMB 추가 -->
+                        <td>{ftp_status}</td> <!-- FTP 추가 -->
                     </tr>
                 """)
             
@@ -853,7 +1092,87 @@ class SecurityScanner:
                     f.write("""
                     <p class="status-closed">상태: 닫힘</p>
                     """)
-                
+
+                # SMB
+                f.write("""
+                    <h4>SMB 서비스</h4>
+                """)
+                if result['smb']['open']:
+                    smb_ports = ", ".join(map(str, result['smb']['ports']))
+                    f.write(f"""
+                    <p class="status-open">상태: 열림 <span class="port-info">(포트: {smb_ports})</span></p>
+                    """)
+                    # 각 SMB 포트에 대한 익명 접속 결과
+                    for port, screenshot_path in result['smb']['screenshots'].items():
+                        if screenshot_path:
+                            try:
+                                with open(screenshot_path, 'r') as smb_file:
+                                    smb_details = smb_file.read()
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 SMB 익명 접속 결과</h5>
+                                    <pre>{smb_details}</pre>
+                                </div>
+                                """)
+                            except FileNotFoundError:
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 SMB 익명 접속 결과</h5>
+                                    <p>결과 파일을 찾을 수 없습니다: {os.path.basename(screenshot_path)}</p>
+                                </div>
+                                """)
+                            except Exception as e:
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 SMB 익명 접속 결과</h5>
+                                    <p>결과 파일을 읽는 중 오류 발생: {e}</p>
+                                </div>
+                                """)
+                else:
+                    f.write("""
+                    <p class="status-closed">상태: 닫힘</p>
+                    """)
+
+                # FTP
+                f.write("""
+                    <h4>FTP 서비스</h4>
+                """)
+                if result['ftp']['open']:
+                    ftp_ports = ", ".join(map(str, result['ftp']['ports']))
+                    f.write(f"""
+                    <p class="status-open">상태: 열림 <span class="port-info">(포트: {ftp_ports})</span></p>
+                    """)
+                    # 각 FTP 포트에 대한 익명 접속 결과
+                    for port, screenshot_path in result['ftp']['screenshots'].items():
+                        if screenshot_path:
+                            try:
+                                with open(screenshot_path, 'r') as ftp_file:
+                                    ftp_details = ftp_file.read()
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 FTP 익명 접속 결과</h5>
+                                    <pre>{ftp_details}</pre>
+                                </div>
+                                """)
+                            except FileNotFoundError:
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 FTP 익명 접속 결과</h5>
+                                    <p>결과 파일을 찾을 수 없습니다: {os.path.basename(screenshot_path)}</p>
+                                </div>
+                                """)
+                            except Exception as e:
+                                f.write(f"""
+                                <div class="service-detail">
+                                    <h5>포트 {port}의 FTP 익명 접속 결과</h5>
+                                    <p>결과 파일을 읽는 중 오류 발생: {e}</p>
+                                </div>
+                                """)
+                else:
+                    f.write("""
+                    <p class="status-closed">상태: 닫힘</p>
+                    """)
+
                 f.write("""
                 </div>
                 """)
@@ -872,14 +1191,15 @@ class SecurityScanner:
         
         with open(report_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTPS', 'HTTPS_포트'])
+            # CSV 헤더에 SMB, FTP 추가
+            writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTPS', 'HTTPS_포트', 'SMB', 'SMB_포트', 'FTP', 'FTP_포트'])
             
             for target, result in self.scan_results.items():
                 responsive_status = "Y" if result.get('responsive', False) else "N"
                 
                 if not result.get('responsive', False):
-                    # 비응답 호스트는 모든 서비스가 닫힘
-                    writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "N", ""])
+                    # 비응답 호스트는 모든 서비스가 닫힘 (SMB, FTP 포함)
+                    writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "N", "", "N", "", "N", ""])
                     continue
                 
                 ssh_status = "Y" if result['ssh']['open'] else "N"
@@ -893,6 +1213,14 @@ class SecurityScanner:
                 
                 https_status = "Y" if result['https']['open'] else "N"
                 https_ports = ";".join(map(str, result['https']['ports'])) if result['https']['ports'] else ""
+
+                # SMB 정보 추가
+                smb_status = "Y" if result['smb']['open'] else "N"
+                smb_ports = ";".join(map(str, result['smb']['ports'])) if result['smb']['ports'] else ""
+
+                # FTP 정보 추가
+                ftp_status = "Y" if result['ftp']['open'] else "N"
+                ftp_ports = ";".join(map(str, result['ftp']['ports'])) if result['ftp']['ports'] else ""
                 
                 writer.writerow([
                     target, 
@@ -900,7 +1228,9 @@ class SecurityScanner:
                     ssh_status, ssh_ports, 
                     rdp_status, rdp_ports, 
                     http_status, http_ports, 
-                    https_status, https_ports
+                    https_status, https_ports,
+                    smb_status, smb_ports, # SMB 추가
+                    ftp_status, ftp_ports  # FTP 추가
                 ])
         
         logger.info(f"CSV 보고서가 {report_path}에 생성되었습니다")
