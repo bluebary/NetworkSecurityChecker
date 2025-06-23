@@ -1,6 +1,4 @@
 security_scan.log
-<<<<<<< HEAD
-=======
 build/*
 dist/*
 build_command.bat
@@ -8,5 +6,4 @@ improved_build_script.txt
 security_scanner.spec
 .gitignore
 .venv/*
->>>>>>> f60787d (.gitignore 및 README.md 업데이트 및 보안 스캐너의 웹드라이버 설정 개선)
 target.txt
