@@ -1,9 +1,0 @@
-security_scan.log
-build/*
-dist/*
-build_command.bat
-improved_build_script.txt
-security_scanner.spec
-.gitignore
-.venv/*
-target.txt
