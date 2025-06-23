@@ -51,6 +51,8 @@ class SecurityScanner:
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--ignore-certificate-errors")
+        chrome_options.add_argument("--allow-insecure-localhost")
         
         # 웹드라이버 설정
         try:
@@ -733,27 +735,21 @@ class SecurityScanner:
         서비스 접근성을 확인하고 스크린샷을 캡처합니다.
                 
         Args:
-<<<<<<< HEAD
             scan_result: nmap 스캔 결과 딕셔너리
-=======
             scan_result: 초기 포트 스캔 결과에서 생성된 상세 스캔 결과 구조
->>>>>>> 101a709 (Update security_scanner.py)
             
         Returns:
             스크린샷 경로로 업데이트된 스캔 결과 딕셔너리
         """
         target = scan_result['ip']
         logger.info(f"{target}에 대한 서비스 확인 중")
-<<<<<<< HEAD
      
-=======
         
         # 호스트가 응답했는지 확인
         if not scan_result['responsive']:
             logger.info(f"{target}은(는) 응답하지 않는 호스트입니다. 서비스 확인을 건너뜁니다.")
             return scan_result
         
->>>>>>> 101a709 (Update security_scanner.py)
         # SSH 확인 (감지된 모든 포트)
         if scan_result['ssh']['open'] and scan_result['ssh']['ports']:
             scan_result['ssh']['screenshots'] = self.capture_ssh_screenshot(target, scan_result['ssh']['ports'])
@@ -1335,24 +1331,15 @@ class SecurityScanner:
         
         with open(report_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-<<<<<<< HEAD
             # CSV 헤더에 SMB, FTP 추가
             writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTPS', 'HTTPS_포트', 'SMB', 'SMB_포트', 'FTP', 'FTP_포트'])
-=======
-            writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTP_오류', 'HTTPS', 'HTTPS_포트', 'HTTPS_오류'])
->>>>>>> 101a709 (Update security_scanner.py)
             
             for target, result in self.scan_results.items():
                 responsive_status = "Y" if result.get('responsive', False) else "N"
                 
                 if not result.get('responsive', False):
-<<<<<<< HEAD
                     # 비응답 호스트는 모든 서비스가 닫힘 (SMB, FTP 포함)
                     writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "N", "", "N", "", "N", ""])
-=======
-                    # 비응답 호스트는 모든 서비스가 닫힘
-                    writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "", "N", "", ""])
->>>>>>> 101a709 (Update security_scanner.py)
                     continue
                 
                 ssh_status = "Y" if result['ssh']['open'] else "N"
@@ -1385,7 +1372,6 @@ class SecurityScanner:
                 
                 https_status = "Y" if result['https']['open'] else "N"
                 https_ports = ";".join(map(str, result['https']['ports'])) if result['https']['ports'] else ""
-<<<<<<< HEAD
 
                 # SMB 정보 추가
                 smb_status = "Y" if result['smb']['open'] else "N"
@@ -1394,42 +1380,16 @@ class SecurityScanner:
                 # FTP 정보 추가
                 ftp_status = "Y" if result['ftp']['open'] else "N"
                 ftp_ports = ";".join(map(str, result['ftp']['ports'])) if result['ftp']['ports'] else ""
-=======
-                https_errors = []
-                for port, file_path in result['https']['screenshots'].items():
-                    if file_path and file_path.endswith('_error.txt'):
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as error_file:
-                                error_lines = error_file.readlines()
-                                # 오류 유형과 메시지만 추출
-                                error_type = ""
-                                error_msg = ""
-                                for line in error_lines:
-                                    if line.startswith("오류 유형:"):
-                                        error_type = line.split(":", 1)[1].strip()
-                                    elif line.startswith("오류 메시지:"):
-                                        error_msg = line.split(":", 1)[1].strip()
-                                if error_type or error_msg:
-                                    https_errors.append(f"Port {port}: {error_type} - {error_msg}")
-                        except Exception:
-                            https_errors.append(f"Port {port}: 오류 파일 읽기 실패")
-                https_error_str = "; ".join(https_errors) if https_errors else ""
->>>>>>> 101a709 (Update security_scanner.py)
                 
                 writer.writerow([
                     target, 
                     responsive_status,
                     ssh_status, ssh_ports, 
                     rdp_status, rdp_ports, 
-<<<<<<< HEAD
                     http_status, http_ports, 
                     https_status, https_ports,
                     smb_status, smb_ports, # SMB 추가
                     ftp_status, ftp_ports  # FTP 추가
-=======
-                    http_status, http_ports, http_error_str,
-                    https_status, https_ports, https_error_str
->>>>>>> 101a709 (Update security_scanner.py)
                 ])
         
         logger.info(f"CSV 보고서가 {report_path}에 생성되었습니다")
