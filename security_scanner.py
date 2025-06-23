@@ -735,27 +735,21 @@ class SecurityScanner:
         서비스 접근성을 확인하고 스크린샷을 캡처합니다.
                 
         Args:
-<<<<<<< HEAD
             scan_result: 초기 포트 스캔 결과에서 생성된 상세 스캔 결과 구조
-=======
             scan_result: nmap 스캔 결과 딕셔너리
->>>>>>> origin/v1.1
             
         Returns:
             스크린샷 경로로 업데이트된 스캔 결과 딕셔너리
         """
         target = scan_result['ip']
         logger.info(f"{target}에 대한 서비스 확인 중")
-<<<<<<< HEAD
         
         # 호스트가 응답했는지 확인
         if not scan_result['responsive']:
             logger.info(f"{target}은(는) 응답하지 않는 호스트입니다. 서비스 확인을 건너뜁니다.")
             return scan_result
         
-=======
      
->>>>>>> origin/v1.1
         # SSH 확인 (감지된 모든 포트)
         if scan_result['ssh']['open'] and scan_result['ssh']['ports']:
             scan_result['ssh']['screenshots'] = self.capture_ssh_screenshot(target, scan_result['ssh']['ports'])
@@ -1337,24 +1331,18 @@ class SecurityScanner:
         
         with open(report_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-<<<<<<< HEAD
             writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTP_오류', 'HTTPS', 'HTTPS_포트', 'HTTPS_오류'])
-=======
             # CSV 헤더에 SMB, FTP 추가
             writer.writerow(['IP', '응답', 'SSH', 'SSH_포트', 'RDP', 'RDP_포트', 'HTTP', 'HTTP_포트', 'HTTPS', 'HTTPS_포트', 'SMB', 'SMB_포트', 'FTP', 'FTP_포트'])
->>>>>>> origin/v1.1
             
             for target, result in self.scan_results.items():
                 responsive_status = "Y" if result.get('responsive', False) else "N"
                 
                 if not result.get('responsive', False):
-<<<<<<< HEAD
                     # 비응답 호스트는 모든 서비스가 닫힘
                     writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "", "N", "", ""])
-=======
                     # 비응답 호스트는 모든 서비스가 닫힘 (SMB, FTP 포함)
                     writer.writerow([target, responsive_status, "N", "", "N", "", "N", "", "N", "", "N", "", "N", ""])
->>>>>>> origin/v1.1
                     continue
                 
                 ssh_status = "Y" if result['ssh']['open'] else "N"
@@ -1387,7 +1375,6 @@ class SecurityScanner:
                 
                 https_status = "Y" if result['https']['open'] else "N"
                 https_ports = ";".join(map(str, result['https']['ports'])) if result['https']['ports'] else ""
-<<<<<<< HEAD
                 https_errors = []
                 for port, file_path in result['https']['screenshots'].items():
                     if file_path and file_path.endswith('_error.txt'):
@@ -1407,7 +1394,6 @@ class SecurityScanner:
                         except Exception:
                             https_errors.append(f"Port {port}: 오류 파일 읽기 실패")
                 https_error_str = "; ".join(https_errors) if https_errors else ""
-=======
 
                 # SMB 정보 추가
                 smb_status = "Y" if result['smb']['open'] else "N"
@@ -1416,7 +1402,6 @@ class SecurityScanner:
                 # FTP 정보 추가
                 ftp_status = "Y" if result['ftp']['open'] else "N"
                 ftp_ports = ";".join(map(str, result['ftp']['ports'])) if result['ftp']['ports'] else ""
->>>>>>> origin/v1.1
                 
                 writer.writerow([
                     target, 
