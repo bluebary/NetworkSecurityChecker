@@ -1409,10 +1409,15 @@ class SecurityScanner:
                     responsive_status,
                     ssh_status, ssh_ports, 
                     rdp_status, rdp_ports, 
+<<<<<<< HEAD
+                    http_status, http_ports, http_error_str,
+                    https_status, https_ports, https_error_str
+=======
                     http_status, http_ports, 
                     https_status, https_ports,
                     smb_status, smb_ports, # SMB 추가
                     ftp_status, ftp_ports  # FTP 추가
+>>>>>>> origin/v1.1
                 ])
         
         logger.info(f"CSV 보고서가 {report_path}에 생성되었습니다")
